@@ -7,11 +7,27 @@ generator client {
 }
 
 model User {
-  id        Int      @id @default(autoincrement())
-  username  String   @unique
+  id        Int       @id @default(autoincrement())
+  email     String    @unique
+  username  String
   password  String
-  avatar    String   @default("")
-  status    String   @default("online")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  avatar    String?   
+  createdAt DateTime  @default(now())
+  
+  messages  Message[] @relation("SentMessages")
+}
+
+model Message {
+  id         Int      @id @default(autoincrement())
+  text       String?  
+  mediaUrl   String?  
+  mediaType  String?  
+  createdAt  DateTime @default(now())
+  
+  // Отправитель сообщения (уже создан)
+  senderId   Int
+  sender     User     @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+
+  // Получатель сообщения (НОВОЕ ПОЛЕ: для лички тут будет ID юзера, для общего чата - null)
+  receiverId Int?     
 }

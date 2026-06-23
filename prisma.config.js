@@ -1,13 +1,8 @@
-import 'dotenv/config';
-import { defineConfig } from "@prisma/config";
-
-export default defineConfig({
+// Чистый экспорт объекта без внешних импортов, чтобы удовлетворить npx prisma
+require('dotenv').config();
+module.exports = {
     schema: "prisma/schema.prisma",
-    migrations: {
-        path: "prisma/migrations",
-    },
     datasource: {
-        url: process.env.DATABASE_URL,
+        url: process.env.DATABASE_URL || "", // Используем стандартный встроенный объект Node.js
     },
-    engineType: "binary" // <-- Принудительно заставляем Prisma использовать бинарный движок
-});
+};
