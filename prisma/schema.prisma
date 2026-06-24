@@ -7,14 +7,15 @@ generator client {
 }
 
 model User {
-  id        Int       @id @default(autoincrement())
-  email     String    @unique
-  username  String
-  password  String
-  avatar    String?   
-  createdAt DateTime  @default(now())
+  id              Int       @id @default(autoincrement())
+  email           String    @unique
+  username        String
+  password        String
+  avatar          String?   
+  createdAt       DateTime  @default(now())
   
-  messages  Message[] @relation("SentMessages")
+  messages        Message[] @relation("SentMessages")
+  createdChannels Channel[] @relation("ChannelCreator")
 }
 
 model Message {
@@ -24,10 +25,22 @@ model Message {
   mediaType  String?  
   createdAt  DateTime @default(now())
   
-  // Отправитель сообщения (уже создан)
   senderId   Int
   sender     User     @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
 
-  // Получатель сообщения (НОВОЕ ПОЛЕ: для лички тут будет ID юзера, для общего чата - null)
   receiverId Int?     
+
+  channelId  Int?
+  channel    Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+}
+
+model Channel {
+  id        Int       @id @default(autoincrement())
+  name      String
+  avatar    String?   
+  creatorId Int       
+  createdAt DateTime  @default(now())
+
+  creator   User      @relation("ChannelCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  messages  Message[]
 }

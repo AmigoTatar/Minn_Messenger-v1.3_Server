@@ -43,9 +43,16 @@ const io = new Server(server, {
 });
 
 // Настраиваем пул соединений через современный чистый JS-драйвер для Prisma 7
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// 🔒 Жестко ограничиваем max: 2, чтобы не взрывать лимиты облачной БД
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 2,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000
+});
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
+
 
 // Сначала делимся клиентом со всеми контроллерами проекта!
 app.set('prisma', prisma);
@@ -85,6 +92,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
         return res.status(500).json({ error: 'Ошибка сервера при сохранении файла' });
     }
 });
+
 // ==========================================
 // 0.1. МАРШРУТ ДЛЯ ПОЛУЧЕНИЯ СПИСКА ПОЛЬЗОВАТЕЛЕЙ (КОНТАКТОВ)
 // ==========================================
@@ -120,6 +128,78 @@ app.get('/api/users', async(req, res) => {
     } catch (error) {
         console.error('Ошибка при получении списка пользователей:', error);
         res.status(500).json({ error: 'Не удалось загрузить список контактов' });
+    }
+}); // 🔒 Роут пользователей теперь герметично закрыт здесь!
+
+// ==========================================
+// 0.2. МАРШРУТ ДЛЯ ПОЛУЧЕНИЯ СПИСКА ПУБЛИЧНЫХ КАНАЛОВ
+// ==========================================
+app.get('/api/channels', async(req, res) => {
+    try {
+        const dbInstance = typeof prisma !== 'undefined' ? prisma : (typeof db !== 'undefined' ? db : null);
+
+        // Запрашиваем список каналов из БД
+        const channelsList = await dbInstance.channel.findMany({
+            orderBy: { id: 'asc' }
+        });
+
+        return res.json(channelsList);
+    } catch (error) {
+        console.error('Ошибка при получении каналов из БД:', error);
+        // Отдаем 500 статус, фронтенд поймает его и сделает автоматический перезапрос через секунду
+        return res.status(500).json({ error: 'База данных временно перегружена' });
+    }
+});
+// 🔒 Роут каналов герметично закрыт здесь!
+
+
+// ==========================================
+// СОЗДАНИЕ НОВОГО КАНАЛА (ЗАЩИЩЕННАЯ ВЕРСИЯ)
+// ==========================================
+app.post('/api/channels', async(req, res) => {
+    try {
+        const { name, avatar, creatorId } = req.body;
+
+        if (!name || !creatorId) {
+            return res.status(400).json({ error: 'Название канала и ID создателя обязательны' });
+        }
+
+        // Определяем, как у тебя называется Prisma в файле. 
+        // Если выше по коду у тебя const db = new PrismaClient(), то используем db, иначе prisma
+        const dbInstance = typeof prisma !== 'undefined' ? prisma : (typeof db !== 'undefined' ? db : null);
+
+        if (!dbInstance) {
+            console.error('❌ Ошибка: Экземпляр Prisma Client не найден в server.js!');
+            return res.status(500).json({ error: 'Конфигурация базы данных нарушена' });
+        }
+
+        // Создаем запись в БД
+        const newChannel = await dbInstance.channel.create({
+            data: {
+                name: name,
+                avatar: avatar || '📢',
+                creatorId: creatorId
+            },
+        });
+
+        // Безопасный вызов сокетов: оборачиваем в отдельный try, чтобы сбой сокетов не валил запрос
+        try {
+            if (req.io) {
+                req.io.emit('channel_created', newChannel);
+            } else if (global.io) {
+                global.io.emit('channel_created', newChannel);
+            } else if (typeof io !== 'undefined') {
+                io.emit('channel_created', newChannel);
+            }
+        } catch (socketError) {
+            console.error('⚠️ Ошибка отправки события через сокеты:', socketError);
+        }
+
+        return res.status(201).json(newChannel);
+
+    } catch (error) {
+        console.error('💥 КРИТИЧЕСКАЯ ОШИБКА РОУТА CHANNELS:', error);
+        return res.status(500).json({ error: 'Внутренняя ошибка сервера' });
     }
 });
 
@@ -233,22 +313,40 @@ io.on('connection', (socket) => {
         try {
             const { text, mediaUrl, mediaType, senderId, activeChatId } = messageData;
             let receiverId = null;
+            let channelId = null; // Новая переменная для БД
             let targetRoom = 'chat_general';
 
+            // 1. ЛОГИКА ЛИЧНЫХ ЧАТОВ
             if (activeChatId && activeChatId.startsWith('user_')) {
                 receiverId = parseInt(activeChatId.replace('user_', ''));
                 const ids = [parseInt(senderId), receiverId].sort((a, b) => a - b);
-                // ИСПРАВЛЕНО: Правильное формирование строки комнаты (например, room_2_3)
                 targetRoom = `room_${ids[0]}_${ids[1]}`;
             }
+            // 2. 🔥 НОВАЯ ЛОГИКА ПУБЛИЧНЫХ КАНАЛОВ
+            else if (activeChatId && activeChatId.startsWith('channel_')) {
+                channelId = parseInt(activeChatId.replace('channel_', ''));
+                targetRoom = `channel_${channelId}`;
 
+                // СТРОГАЯ ЗАЩИТА: Проверяем, является ли отправитель создателем канала
+                const channel = await prisma.channel.findUnique({
+                    where: { id: channelId }
+                });
+
+                if (!channel || channel.creatorId !== parseInt(senderId)) {
+                    console.warn(`[🔒 SECURITY] Юзер ${senderId} пытался спамить в канал ${channelId} без прав!`);
+                    return; // Глухая блокировка сокета
+                }
+            }
+
+            // Сохраняем в базу данных (с учетом новых полей)
             const savedMessage = await prisma.message.create({
                 data: {
                     text: text || null,
                     mediaUrl: mediaUrl || null,
                     mediaType: mediaType || null,
                     senderId: parseInt(senderId),
-                    receiverId: receiverId
+                    receiverId: receiverId,
+                    channelId: channelId // Запишется Int или null
                 },
                 include: {
                     sender: { select: { id: true, username: true } }
@@ -256,6 +354,19 @@ io.on('connection', (socket) => {
             });
 
             const newMessage = {...savedMessage, status: 'unread', activeChatId };
+
+            // Отправка в сокет-комнаты
+            if (channelId) {
+                // Вещаем на всю комнату канала (ее слушают все подписчики, вошедшие в канал через join_chat)
+                io.to(targetRoom).emit('receive_message', newMessage);
+            } else if (receiverId) {
+                // Твоя логика для лички
+                io.to(`user_${senderId}`).to(`user_${receiverId}`).emit('receive_message', newMessage);
+            } else {
+                // Твоя логика для общего чата
+                io.to('chat_general').emit('receive_message', newMessage);
+            }
+
 
             // Вещаем во все персональные ящики
             if (receiverId) {
