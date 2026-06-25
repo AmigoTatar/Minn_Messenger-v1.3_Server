@@ -439,60 +439,51 @@ io.on('connection', (socket) => {
     });
 
     // === 2.1. ОБРАБОТКА ПРОЧТЕНИЯ СООБЩЕНИЙ ===
-    socket.on('read_messages', async({ activeChatId, currentUserId }) => {
+    socket.on('read_messages', async(data) => {
         try {
+            if (!data) return;
+            const { activeChatId, currentUserId } = data;
             if (!activeChatId || !currentUserId) return;
 
-            // Если это личный чат (например, "user_5"), значит мы читаем сообщения от юзера 5
+            const myId = parseInt(currentUserId);
+            let cleanId = null;
+
             if (activeChatId.startsWith('user_')) {
-                const senderId = parseInt(activeChatId.replace('user_', ''));
-
-                // Обновляем статус всех непрочитанных сообщений в этой переписке
-                await prisma.message.updateMany({
-                    where: {
-                        senderId: senderId,
-                        receiverId: parseInt(currentUserId),
-                        // status: 'unread' // если поле status есть в строковом формате
-                    },
-                    data: {
-                        // Если у тебя поле status в Prisma — это обычная строка:
-                        // (Убедись, что твоя Prisma поддерживает обновление этого текстового поля)
-                    }
-                });
-
-                // Отправляем сокет-событие второму участнику, чтобы у него галочки стали синими
-                io.to(`user_${senderId}`).to(`user_${currentUserId}`).emit('messages_marked_as_read', {
-                    activeChatId: `user_${currentUserId}`, // для собеседника активным чатом являемся мы
-                    senderId
-                });
+                cleanId = parseInt(activeChatId.replace('user_', ''));
             }
+
+            console.log(`👁️ Юзер ${myId} прочитал историю чата: ${activeChatId}`);
+
+            // Переменные создаются СТРОГО внутри функции, теперь ошибок не будет
+            const readPayload = { activeChatId, readerId: myId };
+
+            // Оповещаем сокет-комнаты, чтобы фронтенд погасил плашку
+            if (activeChatId.startsWith('user_')) {
+                io.to(`user_${myId}`).to(`user_${cleanId}`).emit('messages_read_update', readPayload);
+            } else if (activeChatId.startsWith('channel_')) {
+                cleanId = parseInt(activeChatId.replace('channel_', ''));
+                io.to(`channel_${cleanId}`).emit('messages_read_update', readPayload);
+            } else {
+                io.to('chat_general').emit('messages_read_update', readPayload);
+            }
+
         } catch (err) {
-            console.error('Ошибка при обновлении статуса прочтения:', err);
+            console.error('Ошибка в обработчике read_messages:', err);
         }
-    });
+    }); // Конец обработчика read_messages
 
 
     // === 3. ТРАНСЛЯЦИЯ СТАТУСА ПЕЧАТАНИЯ ===
-    socket.on('typing', ({ activeChatId, senderId }) => {
-        if (!activeChatId) return;
-
-        if (activeChatId === 'chat_general') {
-            // В общем чате передаем senderId, чтобы все знали, кто пишет
-            socket.to('chat_general').emit('typing', { senderId, isGeneral: true });
-        } else if (activeChatId.startsWith('user_')) {
-            // В личке отправляем пакет напрямую в ящик получателя
-            io.to(activeChatId).emit('typing', { senderId, isGeneral: false });
-        }
+    socket.on('typing', (data) => {
+        if (!data) return;
+        const { activeChatId, senderId } = data;
+        socket.to(activeChatId).emit('typing', { senderId, isGeneral: activeChatId === 'chat_general' });
     });
 
-    socket.on('stop_typing', ({ activeChatId, senderId }) => {
-        if (!activeChatId) return;
-
-        if (activeChatId === 'chat_general') {
-            socket.to('chat_general').emit('stop_typing', { senderId, isGeneral: true });
-        } else if (activeChatId.startsWith('user_')) {
-            io.to(activeChatId).emit('stop_typing', { senderId, isGeneral: false });
-        }
+    socket.on('stop_typing', (data) => {
+        if (!data) return;
+        const { activeChatId } = data;
+        socket.to(activeChatId).emit('stop_typing');
     });
 
 
