@@ -8,18 +8,14 @@ const getMessages = async (req, res) => {
         }
 
         // 1. Извлекаем параметры из query-строки запроса
-        // activeChatId указывает, какую комнату грузим
-        // cursorMessageId указывает ID сообщения, от которого скроллим ВВЕРХ
         const { activeChatId, cursorMessageId } = req.query;
-        
-        // ID текущего авторизованного пользователя (его туда записал наш JWT мидлвейр!)
         const currentUserId = req.userId; 
 
         if (!activeChatId) {
             return res.status(400).json({ error: "Параметр activeChatId обязателен" });
         }
 
-        const limit = 30; // Жестко фиксируем порцию загрузки по 30 штук
+        const limit = 30;
         let whereClause = {};
 
         // 2. СТРОГОЕ ВЕТВЛЕНИЕ ФИЛЬТРАЦИИ НА УРОВНЕ БАЗЫ ДАННЫХ
@@ -52,42 +48,65 @@ const getMessages = async (req, res) => {
                     { senderId: targetUserId, receiverId: currentUserId }
                 ]
             };
-        } else {
+        } 
+        // ✅ Г. ГРУППОВЫЕ ЧАТЫ
+        else if (activeChatId.startsWith('chat_')) {
+            const chatDbId = parseInt(activeChatId.replace('chat_', ''), 10);
+            if (isNaN(chatDbId)) return res.status(400).json({ error: "Невалидный ID группового чата" });
+            
+            whereClause = {
+                chatId: chatDbId
+            };
+        }
+        else {
             return res.status(400).json({ error: "Неизвестный формат чата" });
         }
 
         // 3. НАСТРОЙКА КУРСОРНОЙ ПАГИНАЦИИ PRISMA
-        let queryOptions = {
-            where: whereClause,
-            // Сортируем от СВЕЖИХ к СТАРЫМ (desc), чтобы забирать последние 30 штук из истории чата
-            orderBy: { createdAt: 'desc' },
-            take: limit,
-            include: {
-                sender: {
-                    select: { id: true, username: true }
-                }
-            }
-        };
+// В messageController.js, в queryOptions
+let queryOptions = {
+  where: whereClause,
+  orderBy: { createdAt: 'desc' },
+  take: limit,
+  include: {
+    sender: {
+      select: { id: true, username: true }
+    },
+    threads: {
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      },
+      orderBy: { createdAt: 'asc' }
+    },
+    reactions: {  // ← ДОБАВЛЯЕМ РЕАКЦИИ
+      include: {
+        user: {
+          select: { id: true, username: true }
+        }
+      }
+    }
+  }
+};
 
-        // Если фронтенд передал ID курсора (запрос истории при скролле вверх)
         if (cursorMessageId) {
             const cursorId = Number(cursorMessageId);
             if (!isNaN(cursorId)) {
                 queryOptions.cursor = { id: cursorId };
-                queryOptions.skip = 1; // Пропускаем само сообщение-курсор, чтобы оно не дублировалось
+                queryOptions.skip = 1;
             }
         }
 
         // 4. ЗАПРОС К POSTGRESQL
         const messages = await prisma.message.findMany(queryOptions);
 
-        // Переворачиваем массив обратно (от старых к свежим), чтобы фронтенд отрендерил их сверху вниз
+        // Переворачиваем массив обратно (от старых к свежим)
         const orderedMessages = messages.reverse();
 
-        // Отдаем порцию сообщений и флаг, есть ли еще история для подгрузки
         return res.json({
             messages: orderedMessages,
-            hasMore: messages.length === limit // Если вернулось ровно 30 — значит, в базе есть еще сообщения
+            hasMore: messages.length === limit
         });
 
     } catch (error) {

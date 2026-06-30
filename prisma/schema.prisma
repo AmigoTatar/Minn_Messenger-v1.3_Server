@@ -16,6 +16,12 @@ model User {
   
   messages        Message[] @relation("SentMessages")
   createdChannels Channel[] @relation("ChannelCreator")
+  createdChats    Chat[]    @relation("ChatCreator")
+  
+  channelMembers  ChannelMember[]
+  chatMembers     ChatMember[]
+  threads         Thread[]
+  reactions       Reaction[]
 }
 
 model Message {
@@ -32,15 +38,92 @@ model Message {
 
   channelId  Int?
   channel    Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  
+  chatId     Int?     // ← НОВОЕ: для сообщений в групповых чатах
+  chat       Chat?    @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  
+  threads    Thread[] // ← НОВОЕ: комментарии к сообщению
+  reactions  Reaction[] // ← НОВОЕ: реакции на сообщение
 }
 
 model Channel {
   id        Int       @id @default(autoincrement())
   name      String
-  avatar    String?   
+  avatar    String?   @default("📢")
   creatorId Int       
   createdAt DateTime  @default(now())
 
   creator   User      @relation("ChannelCreator", fields: [creatorId], references: [id], onDelete: Cascade)
   messages  Message[]
+  members   ChannelMember[] // ← НОВОЕ: участники канала
+}
+
+// ==========================================
+// 🆕 НОВЫЕ ТАБЛИЦЫ
+// ==========================================
+
+// 1. УЧАСТНИКИ КАНАЛОВ
+model ChannelMember {
+  id        Int      @id @default(autoincrement())
+  channelId Int
+  userId    Int
+  role      String   @default("member") // "admin" | "member"
+  joinedAt  DateTime @default(now())
+  
+  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([channelId, userId])
+}
+
+// 2. ГРУППОВЫЕ ЧАТЫ
+model Chat {
+  id        Int      @id @default(autoincrement())
+  name      String
+  avatar    String?  @default("💬")
+  creatorId Int
+  createdAt DateTime @default(now())
+  
+  creator   User     @relation("ChatCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  members   ChatMember[]
+  messages  Message[]
+}
+
+// 3. УЧАСТНИКИ ГРУППОВЫХ ЧАТОВ
+model ChatMember {
+  id        Int      @id @default(autoincrement())
+  chatId    Int
+  userId    Int
+  joinedAt  DateTime @default(now())
+  
+  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([chatId, userId])
+}
+
+// 4. КОММЕНТАРИИ (ТРЕДЫ)
+model Thread {
+  id        Int      @id @default(autoincrement())
+  messageId Int
+  userId    Int
+  text      String
+  createdAt DateTime @default(now())
+  
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// 5. РЕАКЦИИ
+model Reaction {
+  id        Int      @id @default(autoincrement())
+  messageId Int
+  userId    Int
+  type      String   // "like" | "heart" | "laugh" | "wow" | "sad" | "angry"
+  createdAt DateTime @default(now())
+  
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([messageId, userId])
 }

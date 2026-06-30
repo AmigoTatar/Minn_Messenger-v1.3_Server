@@ -189,6 +189,54 @@ app.get('/api/channels', authenticateToken, async (req, res) => {
         return res.status(500).json({ error: 'База данных временно перегружена' });
     }
 });
+// Добавьте после маршрута /api/channels
+app.get('/api/unread', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+    
+    // Получаем непрочитанные сообщения для пользователя
+    const unreadMessages = await prisma.message.findMany({
+      where: {
+        OR: [
+          // Приватные чаты
+          { receiverId: userId, status: 'unread' },
+          // Общий чат
+          { 
+            receiverId: null, 
+            channelId: null,
+            NOT: { senderId: userId }
+          },
+          // Каналы (нужно будет добавить логику)
+        ]
+      },
+      select: {
+        id: true,
+        senderId: true,
+        channelId: true,
+        receiverId: true
+      }
+    });
+    
+    // Группируем по чатам
+    const unreadCounts = {};
+    unreadMessages.forEach(msg => {
+      let chatId = 'chat_general';
+      if (msg.channelId) {
+        chatId = `channel_${msg.channelId}`;
+      } else if (msg.receiverId && msg.senderId !== userId) {
+        chatId = `user_${msg.senderId}`;
+      } else if (msg.receiverId && msg.senderId === userId) {
+        chatId = `user_${msg.receiverId}`;
+      }
+      unreadCounts[chatId] = (unreadCounts[chatId] || 0) + 1;
+    });
+    
+    res.json(unreadCounts);
+  } catch (error) {
+    console.error('Ошибка получения непрочитанных:', error);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
 
 // ==========================================
 // СОЗДАНИЕ НОВОГО КАНАЛА
@@ -202,12 +250,22 @@ app.post('/api/channels', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Название канала обязательно' });
         }
 
+        // Создаем канал
         const newChannel = await prisma.channel.create({
             data: {
                 name: name.trim(),
                 avatar: avatar || '📢',
                 creatorId: creatorId
             },
+        });
+
+        // ✅ ДОБАВЛЯЕМ СОЗДАТЕЛЯ В УЧАСТНИКИ КАНАЛА
+        await prisma.channelMember.create({
+            data: {
+                channelId: newChannel.id,
+                userId: creatorId,
+                role: 'admin' // создатель - админ
+            }
         });
 
         try {
@@ -345,170 +403,207 @@ io.on('connection', (socket) => {
         console.log(`🚪 Сокет ${socket.id} (Юзер ${currentUserId}) зафиксирован в комнате: ${chatId}`);
     });
 
-    // === 1. ОБРАБОТКА ОТПРАВКИ СООБЩЕНИЯ ===
-    socket.on('send_message', async (messageData) => {
-        try {
-            const { text, mediaUrl, mediaType, activeChatId } = messageData;
-            const senderId = socket.userId; 
-            
-            let receiverId = null;
-            let channelId = null;
-            let targetRoom = 'chat_general';
+socket.on('send_message', async (messageData) => {
+  try {
+    const { text, mediaUrl, mediaType, activeChatId } = messageData;
+    const senderId = socket.userId;
+    
+    let receiverId = null;
+    let channelId = null;
+    let chatId = null;
+    let targetRoom = 'chat_general';
 
-            if (!activeChatId) return;
+    if (!activeChatId) return;
 
-            if (activeChatId.startsWith('user_')) {
-                receiverId = parseInt(activeChatId.replace('user_', ''), 10);
-                if (isNaN(receiverId)) return;
+    // Определяем тип чата
+    if (activeChatId.startsWith('user_')) {
+      // Приватный чат
+      receiverId = parseInt(activeChatId.replace('user_', ''), 10);
+      if (isNaN(receiverId)) return;
+      const ids = [senderId, receiverId].sort((a, b) => a - b);
+      targetRoom = `room_${ids[0]}_${ids[1]}`;
+    }
+    else if (activeChatId.startsWith('channel_')) {
+      // Публичный канал
+      channelId = parseInt(activeChatId.replace('channel_', ''), 10);
+      if (isNaN(channelId)) return;
+      targetRoom = `channel_${channelId}`;
 
-                const ids = [senderId, receiverId].sort((a, b) => a - b);
-                targetRoom = `room_${ids[0]}_${ids[1]}`;
-            }
-            else if (activeChatId.startsWith('channel_')) {
-                channelId = parseInt(activeChatId.replace('channel_', ''), 10);
-                if (isNaN(channelId)) return;
+      const isMember = await prisma.channelMember.findFirst({
+        where: { channelId: channelId, userId: senderId }
+      });
+      if (!isMember) {
+        console.log(`❌ Юзер ${senderId} не участник канала ${channelId}`);
+        return;
+      }
+    }
+    else if (activeChatId.startsWith('chat_')) {
+      // ✅ ГРУППОВОЙ ЧАТ
+      chatId = parseInt(activeChatId.replace('chat_', ''), 10);
+      if (isNaN(chatId)) return;
+      targetRoom = `chat_${chatId}`;
 
-                targetRoom = `channel_${channelId}`;
+      // Проверяем, что пользователь - участник чата
+      const isMember = await prisma.chatMember.findFirst({
+        where: { chatId: chatId, userId: senderId }
+      });
+      if (!isMember) {
+        console.log(`❌ Юзер ${senderId} не участник чата ${chatId}`);
+        return;
+      }
+    }
 
-                const channel = await prisma.channel.findUnique({
-                    where: { id: channelId }
-                });
-
-                if (!channel || channel.creatorId !== senderId) {
-                    console.warn(`[🔒 SECURITY] Юзер ${senderId} пытался спамить в канал ${channelId} без прав!`);
-                    return;
-                }
-            }
-
-            const savedMessage = await prisma.message.create({
-                data: {
-                    text: text || null,
-                    mediaUrl: mediaUrl || null,
-                    mediaType: mediaType || null,
-                    senderId: senderId,
-                    receiverId: receiverId,
-                    channelId: channelId
-                },
-                include: {
-                    sender: { select: { id: true, username: true } }
-                }
-            });
-
-            const newMessage = { ...savedMessage, status: 'unread', activeChatId };
-
-            if (channelId) {
-                io.to(targetRoom).emit('receive_message', newMessage);
-            } else if (receiverId) {
-                const targetSocketId = onlineUsers.get(receiverId);
-                socket.emit('receive_message', newMessage); 
-                if (targetSocketId) {
-                    io.to(targetSocketId).emit('receive_message', newMessage); 
-                }
-            } else {
-                io.to('chat_general').emit('receive_message', newMessage);
-            }
-
-            if (activeChatId === 'user_1') {
-                socket.emit('typing');
-
-                setTimeout(async () => {
-                    try {
-                        socket.emit('stop_typing');
-
-                        const savedBotMessage = await prisma.message.create({
-                            data: {
-                                text: `Автоответ: Я получил твое сообщение "${text || 'Медиафайл'}"! 🤔`,
-                                senderId: 1,
-                                receiverId: senderId
-                            },
-                            include: {
-                                sender: { select: { id: true, username: true } }
-                            }
-                        });
-
-                        const botMessage = { ...savedBotMessage, status: 'unread', activeChatId: `user_1` };
-                        socket.emit('receive_message', botMessage);
-                    } catch (botErr) {
-                        console.error('Ошибка бота:', botErr);
-                        socket.emit('stop_typing');
-                    }
-                }, 2000);
-            }
-        } catch (error) {
-            console.error('Ошибка сохранения сообщения:', error);
-        }
-    });
-    // === 2. ОБРАБОТКА УДАЛЕНИЯ СООБЩЕНИЯ ===
-    socket.on('delete_message', async ({ messageId, activeChatId }) => {
-        try {
-            const message = await prisma.message.findUnique({
-                where: { id: Number(messageId) }
-            });
-
-            if (!message || message.senderId !== socket.userId) {
-                console.warn(`[🔒 SECURITY] Юзер ${socket.userId} пытался удалить чужое сообщение №${messageId}`);
-                return;
-            }
-
-            const updatedMessage = await prisma.message.update({
-                where: { id: Number(messageId) },
-                data: { text: "Сообщение удалено" }
-            });
-
-            const deletePayload = {
-                messageId: updatedMessage.id,
-                activeChatId,
-                isDeleted: true
-            };
-
-            if (activeChatId && activeChatId.startsWith('user_')) {
-                const receiverId = parseInt(activeChatId.replace('user_', ''), 10);
-                socket.emit('message_deleted', deletePayload);
-                const targetSocketId = onlineUsers.get(receiverId);
-                if (targetSocketId) {
-                    io.to(targetSocketId).emit('message_deleted', deletePayload);
-                }
-            } else if (activeChatId && activeChatId.startsWith('channel_')) {
-                const channelId = parseInt(activeChatId.replace('channel_', ''), 10);
-                io.to(`channel_${channelId}`).emit('message_deleted', deletePayload);
-            } else {
-                io.to('chat_general').emit('message_deleted', deletePayload);
-            }
-            console.log(`🗑️ Сообщение №${messageId} успешно удалено`);
-        } catch (err) {
-            console.error('Ошибка удаления:', err);
-        }
+    // Сохраняем сообщение
+    const savedMessage = await prisma.message.create({
+      data: {
+        text: text || null,
+        mediaUrl: mediaUrl || null,
+        mediaType: mediaType || null,
+        senderId: senderId,
+        receiverId: receiverId,
+        channelId: channelId,
+        chatId: chatId  // ← для групповых чатов
+      },
+      include: {
+        sender: { select: { id: true, username: true } }
+      }
     });
 
-    // === 2.1. ОБРАБОТКА ПРОЧТЕНИЯ СООБЩЕНИЙ ===
-    socket.on('read_messages', async (data) => {
-        try {
-            if (!data) return;
-            const { activeChatId } = data;
-            const myId = socket.userId;
+    const newMessage = { ...savedMessage, activeChatId };
+    console.log(`✅ Сообщение сохранено:`, newMessage);
 
-            if (!activeChatId) return;
+    // Отправляем в комнату
+    if (chatId) {
+      // Групповой чат
+      io.to(`chat_${chatId}`).emit('receive_message', newMessage);
+    } else if (channelId) {
+      // Канал
+      io.to(`channel_${channelId}`).emit('receive_message', newMessage);
+    } else if (receiverId) {
+      // Приватный чат
+      const targetSocketId = onlineUsers.get(receiverId);
+      socket.emit('receive_message', newMessage);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('receive_message', newMessage);
+      }
+    } else {
+      // Общий чат
+      io.to('chat_general').emit('receive_message', newMessage);
+    }
+  } catch (error) {
+    console.error('❌ Ошибка сохранения сообщения:', error);
+  }
+});
 
-            console.log(`👁️ Юзер ${myId} прочитал историю чата: ${activeChatId}`);
-            const readPayload = { activeChatId, readerId: myId };
 
-            if (activeChatId.startsWith('user_')) {
-                const cleanId = parseInt(activeChatId.replace('user_', ''), 10);
-                socket.emit('messages_read_update', readPayload);
-                const targetSocketId = onlineUsers.get(cleanId);
-                if (targetSocketId) {
-                    io.to(targetSocketId).emit('messages_read_update', readPayload);
-                }
-            } else if (activeChatId.startsWith('channel_')) {
-                const cleanId = parseInt(activeChatId.replace('channel_', ''), 10);
-                io.to(`channel_${cleanId}`).emit('messages_read_update', readPayload);
-            } else {
-                io.to('chat_general').emit('messages_read_update', readPayload);
-            }
-        } catch (err) {
-            console.error('Ошибка в обработчике read_messages:', err);
-        }
+socket.on('delete_message', async ({ messageId, activeChatId }) => {
+  try {
+    console.log(`🗑️ Запрос на удаление сообщения ${messageId} от пользователя ${socket.userId}`);
+    
+    const message = await prisma.message.findUnique({
+      where: { id: Number(messageId) }
     });
+
+    if (!message) {
+      console.log('❌ Сообщение не найдено');
+      return;
+    }
+
+    // Проверяем права
+    if (message.senderId !== socket.userId) {
+      if (message.channelId) {
+        const isAdmin = await prisma.channelMember.findFirst({
+          where: {
+            channelId: message.channelId,
+            userId: socket.userId,
+            role: 'admin'
+          }
+        });
+        if (!isAdmin) {
+          console.warn(`[🔒 SECURITY] Юзер ${socket.userId} пытался удалить чужое сообщение №${messageId}`);
+          return;
+        }
+      } else {
+        console.warn(`[🔒 SECURITY] Юзер ${socket.userId} пытался удалить чужое сообщение №${messageId}`);
+        return;
+      }
+    }
+
+    // ✅ ПОЛНОСТЬЮ ОЧИЩАЕМ СООБЩЕНИЕ
+    const updatedMessage = await prisma.message.update({
+      where: { id: Number(messageId) },
+      data: { 
+        text: "Сообщение удалено",
+        mediaUrl: null,  // ← ОЧИЩАЕМ
+        mediaType: null  // ← ОЧИЩАЕМ
+      }
+    });
+
+    const deletePayload = {
+      messageId: updatedMessage.id,
+      activeChatId,
+      isDeleted: true
+    };
+
+    // Рассылаем во все комнаты
+    if (activeChatId && activeChatId.startsWith('user_')) {
+      const receiverId = parseInt(activeChatId.replace('user_', ''), 10);
+      socket.emit('message_deleted', deletePayload);
+      const targetSocketId = onlineUsers.get(receiverId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('message_deleted', deletePayload);
+      }
+    } else if (activeChatId && activeChatId.startsWith('channel_')) {
+      const channelId = parseInt(activeChatId.replace('channel_', ''), 10);
+      io.to(`channel_${channelId}`).emit('message_deleted', deletePayload);
+    } else if (activeChatId && activeChatId.startsWith('chat_')) {
+      const chatId = parseInt(activeChatId.replace('chat_', ''), 10);
+      io.to(`chat_${chatId}`).emit('message_deleted', deletePayload);
+    } else {
+      io.to('chat_general').emit('message_deleted', deletePayload);
+    }
+    
+    console.log(`🗑️ Сообщение №${messageId} успешно удалено`);
+  } catch (err) {
+    console.error('Ошибка удаления:', err);
+  }
+});
+
+// === 2.1. ОБРАБОТКА ПРОЧТЕНИЯ СООБЩЕНИЙ ===
+socket.on('read_messages', async (data) => {
+  try {
+    if (!data) return;
+    const { activeChatId } = data;
+    const myId = socket.userId;
+
+    if (!activeChatId) return;
+
+    console.log(`👁️ Юзер ${myId} прочитал историю чата: ${activeChatId}`);
+
+    // ✅ ПРОСТО ОТПРАВЛЯЕМ СОБЫТИЕ, НЕ ОБНОВЛЯЕМ БД (так как поля status нет)
+    const readPayload = { activeChatId, readerId: myId };
+
+    // Отправляем уведомление о прочтении во все комнаты
+    if (activeChatId.startsWith('channel_')) {
+      const cleanId = parseInt(activeChatId.replace('channel_', ''), 10);
+      io.to(`channel_${cleanId}`).emit('messages_read_update', readPayload);
+      console.log(`✅ Отправлено уведомление о прочтении в канал ${cleanId}`);
+    } else if (activeChatId.startsWith('user_')) {
+      const cleanId = parseInt(activeChatId.replace('user_', ''), 10);
+      socket.emit('messages_read_update', readPayload);
+      const targetSocketId = onlineUsers.get(cleanId);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('messages_read_update', readPayload);
+      }
+      console.log(`✅ Отправлено уведомление о прочтении в приватный чат с ${cleanId}`);
+    } else {
+      io.to('chat_general').emit('messages_read_update', readPayload);
+      console.log(`✅ Отправлено уведомление о прочтении в Общий чат`);
+    }
+  } catch (err) {
+    console.error('Ошибка в обработчике read_messages:', err);
+  }
+});
 
     // === 3. ТРАНСЛЯЦИЯ СТАТУСА ПЕЧАТАНИЯ ===
     socket.on('typing', (data) => {
@@ -549,6 +644,38 @@ io.on('connection', (socket) => {
             }
         }
     });
+    // === УДАЛЕНИЕ КАНАЛА ЧЕРЕЗ СОКЕТ ===
+socket.on('delete_channel', async ({ channelId }) => {
+  try {
+    const userId = socket.userId;
+    
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId }
+    });
+
+    if (!channel) {
+      socket.emit('error', { message: 'Канал не найден' });
+      return;
+    }
+
+    if (channel.creatorId !== userId) {
+      socket.emit('error', { message: 'Только создатель может удалить канал' });
+      return;
+    }
+
+    await prisma.channel.delete({
+      where: { id: channelId }
+    });
+
+    // Рассылаем всем
+    io.emit('channel_deleted', { channelId });
+    console.log(`🗑️ Канал ${channelId} удален через сокет пользователем ${userId}`);
+
+  } catch (error) {
+    console.error('Ошибка удаления канала через сокет:', error);
+    socket.emit('error', { message: 'Не удалось удалить канал' });
+  }
+});
 
     // === 4. ОБРАБОТКА ОТКЛЮЧЕНИЯ ПОЛЬЗОВАТЕЛЯ ===
     socket.on('disconnect', () => {
@@ -560,7 +687,793 @@ io.on('connection', (socket) => {
             io.emit('user_status_change', { userId, status: 'offline' });
         }
     });
+
+// === 7. ТРЕДЫ (ЧЕРЕЗ СОКЕТ) ===
+socket.on('create_thread', async ({ messageId, text, activeChatId }) => {
+  try {
+    const userId = socket.userId;
+
+    if (!text || !text.trim()) {
+      socket.emit('error', { message: 'Текст комментария обязателен' });
+      return;
+    }
+
+    const message = await prisma.message.findUnique({
+      where: { id: messageId }
+    });
+
+    if (!message) {
+      socket.emit('error', { message: 'Сообщение не найдено' });
+      return;
+    }
+
+    const thread = await prisma.thread.create({
+      data: {
+        messageId: messageId,
+        userId: userId,
+        text: text.trim()
+      },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+
+    // Отправляем всем в комнате чата
+    io.to(activeChatId || 'chat_general').emit('thread_created', {
+      thread,
+      messageId,
+      activeChatId
+    });
+
+  } catch (error) {
+    console.error('Ошибка создания треда через сокет:', error);
+    socket.emit('error', { message: 'Не удалось создать комментарий' });
+  }
+});
+
+// === 8. РЕАКЦИИ (ЧЕРЕЗ СОКЕТ) ===
+socket.on('toggle_reaction', async ({ messageId, type, activeChatId }) => {
+  try {
+    const userId = socket.userId;
+
+    if (!type) {
+      socket.emit('error', { message: 'Тип реакции обязателен' });
+      return;
+    }
+
+    const existingReaction = await prisma.reaction.findUnique({
+      where: {
+        messageId_userId: {
+          messageId: messageId,
+          userId: userId
+        }
+      }
+    });
+
+    if (existingReaction) {
+      await prisma.reaction.delete({
+        where: {
+          messageId_userId: {
+            messageId: messageId,
+            userId: userId
+          }
+        }
+      });
+    } else {
+      await prisma.reaction.create({
+        data: {
+          messageId: messageId,
+          userId: userId,
+          type: type
+        }
+      });
+    }
+
+    // Получаем все реакции для сообщения
+    const allReactions = await prisma.reaction.findMany({
+      where: { messageId: messageId },
+      include: {
+        user: {
+          select: { id: true, username: true }
+        }
+      }
+    });
+
+    // Отправляем обновление в комнату
+    io.to(activeChatId || 'chat_general').emit('reaction_updated', {
+      messageId,
+      reactions: allReactions
+    });
+
+  } catch (error) {
+    console.error('Ошибка при работе с реакцией через сокет:', error);
+    socket.emit('error', { message: 'Не удалось обработать реакцию' });
+  }
+});
+
+
+
 }); // <--- Вот здесь закрывается io.on('connection')
+
+
+// ==========================================
+// 4. УЧАСТНИКИ КАНАЛОВ
+// ==========================================
+
+// Получить список участников канала
+app.get('/api/channels/:channelId/members', authenticateToken, async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId);
+
+    const members = await prisma.channelMember.findMany({
+      where: { channelId: channelId },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+
+    res.json(members);
+  } catch (error) {
+    console.error('Ошибка получения участников канала:', error);
+    res.status(500).json({ error: 'Не удалось получить участников' });
+  }
+});
+
+// Добавить участника в канал (только админ)
+app.post('/api/channels/:channelId/members', authenticateToken, async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId);
+    const { userId } = req.body;
+    const currentUserId = req.userId;
+
+    // Проверяем, что канал существует
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId }
+    });
+
+    if (!channel) {
+      return res.status(404).json({ error: 'Канал не найден' });
+    }
+
+    // Проверяем права (только админ)
+    const isAdmin = await prisma.channelMember.findFirst({
+      where: {
+        channelId: channelId,
+        userId: currentUserId,
+        role: 'admin'
+      }
+    });
+
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Только админ может добавлять участников' });
+    }
+
+    // Проверяем, что пользователь не уже участник
+    const existingMember = await prisma.channelMember.findUnique({
+      where: {
+        channelId_userId: {
+          channelId: channelId,
+          userId: userId
+        }
+      }
+    });
+
+    if (existingMember) {
+      return res.status(400).json({ error: 'Пользователь уже участник канала' });
+    }
+
+    // Добавляем участника
+    const member = await prisma.channelMember.create({
+      data: {
+        channelId: channelId,
+        userId: userId,
+        role: 'member'
+      },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+
+    res.status(201).json(member);
+  } catch (error) {
+    console.error('Ошибка добавления участника в канал:', error);
+    res.status(500).json({ error: 'Не удалось добавить участника' });
+  }
+});
+
+// Удалить участника из канала (только админ)
+app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId);
+    const userId = parseInt(req.params.userId);
+    const currentUserId = req.userId;
+
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId }
+    });
+
+    if (!channel) {
+      return res.status(404).json({ error: 'Канал не найден' });
+    }
+
+    // Проверяем права (только админ)
+    const isAdmin = await prisma.channelMember.findFirst({
+      where: {
+        channelId: channelId,
+        userId: currentUserId,
+        role: 'admin'
+      }
+    });
+
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Только админ может удалять участников' });
+    }
+
+    // Нельзя удалить создателя канала
+    if (userId === channel.creatorId) {
+      return res.status(400).json({ error: 'Нельзя удалить создателя канала' });
+    }
+
+    // Удаляем участника
+    await prisma.channelMember.delete({
+      where: {
+        channelId_userId: {
+          channelId: channelId,
+          userId: userId
+        }
+      }
+    });
+
+    res.json({ success: true, message: 'Участник удален из канала' });
+  } catch (error) {
+    console.error('Ошибка удаления участника из канала:', error);
+    res.status(500).json({ error: 'Не удалось удалить участника' });
+  }
+});
+// Удалить участника из канала (только админ)
+app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId);
+    const userId = parseInt(req.params.userId);
+    const currentUserId = req.userId;
+
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId }
+    });
+
+    if (!channel) {
+      return res.status(404).json({ error: 'Канал не найден' });
+    }
+
+    // ✅ ПРОВЕРКА ЧЕРЕЗ TABLICE ChannelMember
+    const isAdmin = await prisma.channelMember.findFirst({
+      where: {
+        channelId: channelId,
+        userId: currentUserId,
+        role: 'admin'
+      }
+    });
+
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Только админ может удалять участников' });
+    }
+
+    // Нельзя удалить создателя канала
+    if (userId === channel.creatorId) {
+      return res.status(400).json({ error: 'Нельзя удалить создателя канала' });
+    }
+
+    // Удаляем участника
+    await prisma.channelMember.delete({
+      where: {
+        channelId_userId: {
+          channelId: channelId,
+          userId: userId
+        }
+      }
+    });
+
+    res.json({ success: true, message: 'Участник удален из канала' });
+  } catch (error) {
+    console.error('Ошибка удаления участника из канала:', error);
+    res.status(500).json({ error: 'Не удалось удалить участника' });
+  }
+});
+// ==========================================
+// 5. ГРУППОВЫЕ ЧАТЫ
+// ==========================================
+
+// Создать групповой чат
+app.post('/api/chats', authenticateToken, async (req, res) => {
+  try {
+    const { name, avatar, memberIds } = req.body;
+    const creatorId = req.userId;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Название чата обязательно' });
+    }
+
+    // Создаем чат
+    const chat = await prisma.chat.create({
+      data: {
+        name: name.trim(),
+        avatar: avatar || '💬',
+        creatorId: creatorId
+      }
+    });
+
+    // ✅ Добавляем создателя как участника
+    await prisma.chatMember.create({
+      data: {
+        chatId: chat.id,
+        userId: creatorId
+      }
+    });
+
+    // ✅ Добавляем остальных участников
+    if (memberIds && Array.isArray(memberIds)) {
+      for (const userId of memberIds) {
+        if (userId !== creatorId) {
+          await prisma.chatMember.create({
+            data: {
+              chatId: chat.id,
+              userId: userId
+            }
+          });
+        }
+      }
+    }
+
+    // Возвращаем созданный чат с участниками
+    const newChat = await prisma.chat.findUnique({
+      where: { id: chat.id },
+      include: {
+        members: {
+          include: {
+            user: {
+              select: { id: true, username: true, avatar: true }
+            }
+          }
+        }
+      }
+    });
+
+    res.status(201).json({
+      id: `chat_${newChat.id}`,
+      dbId: newChat.id,
+      name: newChat.name,
+      avatar: newChat.avatar || '💬',
+      creatorId: newChat.creatorId,
+      members: newChat.members,
+      type: 'group'
+    });
+  } catch (error) {
+    console.error('Ошибка создания группового чата:', error);
+    res.status(500).json({ error: 'Не удалось создать чат' });
+  }
+});
+
+// ==========================================
+// 5.1. ПОЛУЧИТЬ ВСЕ ГРУППОВЫЕ ЧАТЫ ПОЛЬЗОВАТЕЛЯ
+// ==========================================
+
+app.get('/api/chats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    const chats = await prisma.chat.findMany({
+      where: {
+        members: {
+          some: { userId: userId }
+        }
+      },
+      include: {
+        members: {
+          include: {
+            user: {
+              select: { id: true, username: true, avatar: true }
+            }
+          }
+        },
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 1
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    // Форматируем для фронтенда
+    const formattedChats = chats.map(chat => ({
+      id: `chat_${chat.id}`,
+      dbId: chat.id,
+      name: chat.name,
+      avatar: chat.avatar || '💬',
+      creatorId: chat.creatorId,
+      members: chat.members,
+      lastMessage: chat.messages[0] || null,
+      unreadCount: 0,
+      type: 'group'
+    }));
+
+    res.json(formattedChats);
+  } catch (error) {
+    console.error('Ошибка получения групповых чатов:', error);
+    res.status(500).json({ error: 'Не удалось загрузить чаты' });
+  }
+});
+
+// ==========================================
+// 5.2. ПОЛУЧИТЬ УЧАСТНИКОВ ГРУППОВОГО ЧАТА
+// ==========================================
+
+app.get('/api/chats/:chatId/members', authenticateToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.chatId);
+
+    const members = await prisma.chatMember.findMany({
+      where: { chatId: chatId },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+
+    res.json(members);
+  } catch (error) {
+    console.error('Ошибка получения участников чата:', error);
+    res.status(500).json({ error: 'Не удалось получить участников' });
+  }
+});
+// ==========================================
+// 5.3. ДОБАВИТЬ УЧАСТНИКА В ГРУППОВОЙ ЧАТ
+// ==========================================
+
+app.post('/api/chats/:chatId/members', authenticateToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.chatId);
+    const { userId } = req.body;
+    const currentUserId = req.userId;
+
+    // Проверяем, что чат существует
+    const chat = await prisma.chat.findUnique({
+      where: { id: chatId }
+    });
+
+    if (!chat) {
+      return res.status(404).json({ error: 'Чат не найден' });
+    }
+
+    // Проверяем, что пользователь уже не участник
+    const existingMember = await prisma.chatMember.findUnique({
+      where: {
+        chatId_userId: {
+          chatId: chatId,
+          userId: userId
+        }
+      }
+    });
+
+    if (existingMember) {
+      return res.status(400).json({ error: 'Пользователь уже участник чата' });
+    }
+
+    // Добавляем участника
+    const member = await prisma.chatMember.create({
+      data: {
+        chatId: chatId,
+        userId: userId
+      },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+
+    res.status(201).json(member);
+  } catch (error) {
+    console.error('Ошибка добавления участника в чат:', error);
+    res.status(500).json({ error: 'Не удалось добавить участника' });
+  }
+});
+// ==========================================
+// 5.4. УДАЛИТЬ УЧАСТНИКА ИЗ ГРУППОВОГО ЧАТА
+// ==========================================
+
+app.delete('/api/chats/:chatId/members/:userId', authenticateToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.chatId);
+    const userId = parseInt(req.params.userId);
+    const currentUserId = req.userId;
+
+    const chat = await prisma.chat.findUnique({
+      where: { id: chatId }
+    });
+
+    if (!chat) {
+      return res.status(404).json({ error: 'Чат не найден' });
+    }
+
+    // Нельзя удалить создателя чата
+    if (userId === chat.creatorId) {
+      return res.status(400).json({ error: 'Нельзя удалить создателя чата' });
+    }
+
+    // Удаляем участника
+    await prisma.chatMember.delete({
+      where: {
+        chatId_userId: {
+          chatId: chatId,
+          userId: userId
+        }
+      }
+    });
+
+    res.json({ success: true, message: 'Участник удален из чата' });
+  } catch (error) {
+    console.error('Ошибка удаления участника из чата:', error);
+    res.status(500).json({ error: 'Не удалось удалить участника' });
+  }
+});
+
+// ==========================================
+// УДАЛЕНИЕ КАНАЛА
+// ==========================================
+
+app.delete('/api/channels/:channelId', authenticateToken, async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId);
+    const userId = req.userId;
+
+    // Проверяем, что канал существует
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId }
+    });
+
+    if (!channel) {
+      return res.status(404).json({ error: 'Канал не найден' });
+    }
+
+    // Проверяем, что пользователь - создатель канала
+    if (channel.creatorId !== userId) {
+      return res.status(403).json({ error: 'Только создатель может удалить канал' });
+    }
+
+    // Удаляем канал (все связанные записи удалятся благодаря onDelete: Cascade)
+    await prisma.channel.delete({
+      where: { id: channelId }
+    });
+
+    // Отправляем событие через сокеты
+    io.emit('channel_deleted', { channelId });
+
+    console.log(`🗑️ Канал ${channelId} удален пользователем ${userId}`);
+    res.json({ success: true, message: 'Канал удален' });
+
+  } catch (error) {
+    console.error('Ошибка удаления канала:', error);
+    res.status(500).json({ error: 'Не удалось удалить канал' });
+  }
+});
+
+// ==========================================
+// 7. ТРЕДЫ (КОММЕНТАРИИ К СООБЩЕНИЯМ)
+// ==========================================
+
+// Получить треды для сообщения
+app.get('/api/messages/:messageId/threads', authenticateToken, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId);
+    
+    const threads = await prisma.thread.findMany({
+      where: { messageId: messageId },
+      orderBy: { createdAt: 'asc' },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+    
+    res.json(threads);
+  } catch (error) {
+    console.error('Ошибка получения тредов:', error);
+    res.status(500).json({ error: 'Не удалось получить комментарии' });
+  }
+});
+
+// Создать тред (ответ на сообщение)
+app.post('/api/messages/:messageId/threads', authenticateToken, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId);
+    const userId = req.userId;
+    const { text } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Текст комментария обязателен' });
+    }
+
+    // Проверяем, что сообщение существует
+    const message = await prisma.message.findUnique({
+      where: { id: messageId }
+    });
+
+    if (!message) {
+      return res.status(404).json({ error: 'Сообщение не найдено' });
+    }
+
+    const thread = await prisma.thread.create({
+      data: {
+        messageId: messageId,
+        userId: userId,
+        text: text.trim()
+      },
+      include: {
+        user: {
+          select: { id: true, username: true, avatar: true }
+        }
+      }
+    });
+
+    // Отправляем через сокеты
+    io.emit('thread_created', { 
+      thread, 
+      messageId, 
+      activeChatId: req.query.activeChatId || 'chat_general' 
+    });
+
+    res.status(201).json(thread);
+  } catch (error) {
+    console.error('Ошибка создания треда:', error);
+    res.status(500).json({ error: 'Не удалось создать комментарий' });
+  }
+});
+
+// Удалить тред (только автор)
+app.delete('/api/threads/:threadId', authenticateToken, async (req, res) => {
+  try {
+    const threadId = parseInt(req.params.threadId);
+    const userId = req.userId;
+
+    const thread = await prisma.thread.findUnique({
+      where: { id: threadId }
+    });
+
+    if (!thread) {
+      return res.status(404).json({ error: 'Комментарий не найден' });
+    }
+
+    if (thread.userId !== userId) {
+      return res.status(403).json({ error: 'Только автор может удалить комментарий' });
+    }
+
+    await prisma.thread.delete({
+      where: { id: threadId }
+    });
+
+    res.json({ success: true, message: 'Комментарий удален' });
+  } catch (error) {
+    console.error('Ошибка удаления треда:', error);
+    res.status(500).json({ error: 'Не удалось удалить комментарий' });
+  }
+});
+
+// ==========================================
+// 8. РЕАКЦИИ
+// ==========================================
+
+// Добавить или убрать реакцию (toggle)
+app.post('/api/messages/:messageId/reactions', authenticateToken, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId);
+    const userId = req.userId;
+    const { type } = req.body; // "like" | "heart" | "laugh" | "wow" | "sad" | "angry"
+
+    if (!type) {
+      return res.status(400).json({ error: 'Тип реакции обязателен' });
+    }
+
+    // Проверяем, есть ли уже такая реакция от этого пользователя
+    const existingReaction = await prisma.reaction.findUnique({
+      where: {
+        messageId_userId: {
+          messageId: messageId,
+          userId: userId
+        }
+      }
+    });
+
+    let reaction;
+    let action;
+
+    if (existingReaction) {
+      // Если реакция уже есть — удаляем (toggle off)
+      await prisma.reaction.delete({
+        where: {
+          messageId_userId: {
+            messageId: messageId,
+            userId: userId
+          }
+        }
+      });
+      action = 'removed';
+      reaction = null;
+    } else {
+      // Создаем новую реакцию
+      reaction = await prisma.reaction.create({
+        data: {
+          messageId: messageId,
+          userId: userId,
+          type: type
+        },
+        include: {
+          user: {
+            select: { id: true, username: true }
+          }
+        }
+      });
+      action = 'added';
+    }
+
+    // Получаем все реакции для этого сообщения
+    const allReactions = await prisma.reaction.findMany({
+      where: { messageId: messageId },
+      include: {
+        user: {
+          select: { id: true, username: true }
+        }
+      }
+    });
+
+    // Отправляем через сокеты
+    io.emit('reaction_updated', {
+      messageId,
+      reactions: allReactions,
+      action,
+      reaction
+    });
+
+    res.json({ 
+      success: true, 
+      action, 
+      reaction,
+      reactions: allReactions
+    });
+
+  } catch (error) {
+    console.error('Ошибка при работе с реакцией:', error);
+    res.status(500).json({ error: 'Не удалось обработать реакцию' });
+  }
+});
+
+// Получить все реакции для сообщения
+app.get('/api/messages/:messageId/reactions', authenticateToken, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.messageId);
+    
+    const reactions = await prisma.reaction.findMany({
+      where: { messageId: messageId },
+      include: {
+        user: {
+          select: { id: true, username: true }
+        }
+      }
+    });
+    
+    res.json(reactions);
+  } catch (error) {
+    console.error('Ошибка получения реакций:', error);
+    res.status(500).json({ error: 'Не удалось получить реакции' });
+  }
+});
 
 // === ЗАПУСК СЕРВЕРА ===
 const PORT = 5001;
