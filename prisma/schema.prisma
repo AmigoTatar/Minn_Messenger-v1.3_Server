@@ -1,11 +1,11 @@
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
+  url      = "file:./dev.db"
 }
 
 generator client {
   provider = "prisma-client-js"
 }
-
 model User {
   id              Int       @id @default(autoincrement())
   email           String    @unique
@@ -22,6 +22,10 @@ model User {
   chatMembers     ChatMember[]
   threads         Thread[]
   reactions       Reaction[]
+  
+  // ✅ ДЛЯ ПРИВАТНЫХ ЧАТОВ
+  privateChats    PrivateChatMember[] @relation("UserPrivateChats")
+  privateChatsWith PrivateChatMember[] @relation("OtherUserPrivateChats")
 }
 
 model Message {
@@ -29,6 +33,7 @@ model Message {
   text       String?  
   mediaUrl   String?  
   mediaType  String?  
+  status     String?  @default("sent") // "sent" | "read" | "unread"
   createdAt  DateTime @default(now())
   
   senderId   Int
@@ -39,11 +44,11 @@ model Message {
   channelId  Int?
   channel    Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
   
-  chatId     Int?     // ← НОВОЕ: для сообщений в групповых чатах
+  chatId     Int?
   chat       Chat?    @relation(fields: [chatId], references: [id], onDelete: Cascade)
   
-  threads    Thread[] // ← НОВОЕ: комментарии к сообщению
-  reactions  Reaction[] // ← НОВОЕ: реакции на сообщение
+  threads    Thread[]
+  reactions  Reaction[]
 }
 
 model Channel {
@@ -55,28 +60,23 @@ model Channel {
 
   creator   User      @relation("ChannelCreator", fields: [creatorId], references: [id], onDelete: Cascade)
   messages  Message[]
-  members   ChannelMember[] // ← НОВОЕ: участники канала
+  members   ChannelMember[]
 }
 
-// ==========================================
-// 🆕 НОВЫЕ ТАБЛИЦЫ
-// ==========================================
-
-// 1. УЧАСТНИКИ КАНАЛОВ
 model ChannelMember {
-  id        Int      @id @default(autoincrement())
-  channelId Int
-  userId    Int
-  role      String   @default("member") // "admin" | "member"
-  joinedAt  DateTime @default(now())
+  id          Int      @id @default(autoincrement())
+  channelId   Int
+  userId      Int
+  role        String   @default("member")
+  joinedAt    DateTime @default(now())
+  lastReadAt  DateTime @default(now())
   
-  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel     Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   @@unique([channelId, userId])
 }
 
-// 2. ГРУППОВЫЕ ЧАТЫ
 model Chat {
   id        Int      @id @default(autoincrement())
   name      String
@@ -89,20 +89,35 @@ model Chat {
   messages  Message[]
 }
 
-// 3. УЧАСТНИКИ ГРУППОВЫХ ЧАТОВ
 model ChatMember {
-  id        Int      @id @default(autoincrement())
-  chatId    Int
-  userId    Int
-  joinedAt  DateTime @default(now())
+  id          Int      @id @default(autoincrement())
+  chatId      Int
+  userId      Int
+  joinedAt    DateTime @default(now())
+  lastReadAt  DateTime @default(now())
   
-  chat      Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chat        Chat     @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   @@unique([chatId, userId])
 }
 
-// 4. КОММЕНТАРИИ (ТРЕДЫ)
+// ✅ НОВАЯ МОДЕЛЬ ДЛЯ ПРИВАТНЫХ ЧАТОВ
+model PrivateChatMember {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  otherUserId Int
+  lastReadAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation("UserPrivateChats", fields: [userId], references: [id], onDelete: Cascade)
+  otherUser   User     @relation("OtherUserPrivateChats", fields: [otherUserId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, otherUserId])
+  @@index([userId])
+  @@index([otherUserId])
+}
+
 model Thread {
   id        Int      @id @default(autoincrement())
   messageId Int
@@ -114,12 +129,11 @@ model Thread {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
-// 5. РЕАКЦИИ
 model Reaction {
   id        Int      @id @default(autoincrement())
   messageId Int
   userId    Int
-  type      String   // "like" | "heart" | "laugh" | "wow" | "sad" | "angry"
+  type      String
   createdAt DateTime @default(now())
   
   message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
