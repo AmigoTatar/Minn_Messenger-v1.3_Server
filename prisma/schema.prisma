@@ -6,6 +6,7 @@ datasource db {
 generator client {
   provider = "prisma-client-js"
 }
+
 model User {
   id              Int       @id @default(autoincrement())
   email           String    @unique
@@ -14,53 +15,53 @@ model User {
   avatar          String?   
   createdAt       DateTime  @default(now())
   
-  messages        Message[] @relation("SentMessages")
-  createdChannels Channel[] @relation("ChannelCreator")
-  createdChats    Chat[]    @relation("ChatCreator")
+  messages        Message[] 
+  createdChannels Channel[] 
+  createdChats    Chat[]    
   
   channelMembers  ChannelMember[]
   chatMembers     ChatMember[]
   threads         Thread[]
   reactions       Reaction[]
   
-  // ✅ ДЛЯ ПРИВАТНЫХ ЧАТОВ
   privateChats    PrivateChatMember[] @relation("UserPrivateChats")
   privateChatsWith PrivateChatMember[] @relation("OtherUserPrivateChats")
 }
 
 model Message {
-  id         Int      @id @default(autoincrement())
-  text       String?  
-  mediaUrl   String?  
-  mediaType  String?  
-  status     String?  @default("sent") // "sent" | "read" | "unread"
-  createdAt  DateTime @default(now())
+  id          Int      @id @default(autoincrement())
+  text        String?  
+  mediaUrl    String?  
+  mediaType   String?  
+  status      String?  @default("sent")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
   
-  senderId   Int
-  sender     User     @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
-
-  receiverId Int?     
-
-  channelId  Int?
-  channel    Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  senderId    Int
+  sender      User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  receiverId  Int?     
+  channelId   Int?
+  channel     Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  chatId      Int?
+  chat        Chat?    @relation(fields: [chatId], references: [id], onDelete: Cascade)
   
-  chatId     Int?
-  chat       Chat?    @relation(fields: [chatId], references: [id], onDelete: Cascade)
+  isForwarded Boolean? @default(false)  // 👈 ДОБАВЬ ЭТУ СТРОКУ
   
-  threads    Thread[]
-  reactions  Reaction[]
+  threads     Thread[]
+  reactions   Reaction[]
 }
 
 model Channel {
-  id        Int       @id @default(autoincrement())
-  name      String
-  avatar    String?   @default("📢")
-  creatorId Int       
-  createdAt DateTime  @default(now())
-
-  creator   User      @relation("ChannelCreator", fields: [creatorId], references: [id], onDelete: Cascade)
-  messages  Message[]
-  members   ChannelMember[]
+  id            Int      @id @default(autoincrement())
+  name          String
+  avatar        String?  @default("📢")
+  creatorId     Int
+  creator       User     @relation(fields: [creatorId], references: [id])
+  members       ChannelMember[]
+  messages      Message[]
+  lastMessageId Int?     
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }
 
 model ChannelMember {
@@ -78,15 +79,16 @@ model ChannelMember {
 }
 
 model Chat {
-  id        Int      @id @default(autoincrement())
-  name      String
-  avatar    String?  @default("💬")
-  creatorId Int
-  createdAt DateTime @default(now())
-  
-  creator   User     @relation("ChatCreator", fields: [creatorId], references: [id], onDelete: Cascade)
-  members   ChatMember[]
-  messages  Message[]
+  id            Int      @id @default(autoincrement())
+  name          String
+  avatar        String?  @default("💬")
+  creatorId     Int
+  creator       User     @relation(fields: [creatorId], references: [id])
+  members       ChatMember[]
+  messages      Message[]
+  lastMessageId Int?     
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 }
 
 model ChatMember {
@@ -102,7 +104,6 @@ model ChatMember {
   @@unique([chatId, userId])
 }
 
-// ✅ НОВАЯ МОДЕЛЬ ДЛЯ ПРИВАТНЫХ ЧАТОВ
 model PrivateChatMember {
   id          Int      @id @default(autoincrement())
   userId      Int
