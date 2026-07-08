@@ -1991,6 +1991,115 @@ app.get('/api/messages/:messageId/reactions', authenticateToken, async(req, res)
     }
 });
 
+// ==========================================
+// ИЗМЕНЕНИЕ ПРОФИЛЯ ПОЛЬЗОВАТЕЛЯ
+// ==========================================
+app.put('/api/users/profile', authenticateToken, async(req, res) => {
+    try {
+        const userId = req.userId;
+        const { username } = req.body;
+
+        if (!username || username.trim().length < 3) {
+            return res.status(400).json({
+                error: 'Имя должно содержать минимум 3 символа'
+            });
+        }
+
+        // Проверяем, не занято ли имя другим пользователем
+        const existingUser = await prisma.user.findFirst({
+            where: {
+                username: username.trim(),
+                NOT: { id: userId }
+            }
+        });
+
+        if (existingUser) {
+            return res.status(400).json({
+                error: 'Это имя уже занято'
+            });
+        }
+
+        // Обновляем пользователя
+        const updatedUser = await prisma.user.update({
+            where: { id: userId },
+            data: {
+                username: username.trim()
+            },
+            select: {
+                id: true,
+                username: true,
+                avatar: true
+            }
+        });
+
+        // ✅ ОТПРАВЛЯЕМ СОБЫТИЕ ВСЕМ ОНЛАЙН-ПОЛЬЗОВАТЕЛЯМ
+        io.emit('user_updated', {
+            userId: userId,
+            username: updatedUser.username,
+            avatar: updatedUser.avatar
+        });
+
+        res.json({
+            success: true,
+            user: updatedUser
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка обновления профиля:', error);
+        res.status(500).json({
+            error: 'Не удалось обновить профиль'
+        });
+    }
+});
+
+// ==========================================
+// ЗАГРУЗКА АВАТАРКИ
+// ==========================================
+app.put('/api/users/avatar', authenticateToken, upload.single('avatar'), async(req, res) => {
+    try {
+        const userId = req.userId;
+
+        if (!req.file) {
+            return res.status(400).json({ error: 'Файл не загружен' });
+        }
+
+        // Формируем URL для аватарки
+        const avatarUrl = `/uploads/${req.file.filename}`;
+
+        // Обновляем пользователя
+        const updatedUser = await prisma.user.update({
+            where: { id: userId },
+            data: {
+                avatar: avatarUrl
+            },
+            select: {
+                id: true,
+                username: true,
+                avatar: true
+            }
+        });
+
+        // ✅ ОТПРАВЛЯЕМ СОБЫТИЕ ВСЕМ ОНЛАЙН-ПОЛЬЗОВАТЕЛЯМ
+        io.emit('user_updated', {
+            userId: userId,
+            username: updatedUser.username,
+            avatar: updatedUser.avatar
+        });
+
+        res.json({
+            success: true,
+            user: updatedUser
+        });
+
+    } catch (error) {
+        console.error('❌ Ошибка загрузки аватарки:', error);
+        res.status(500).json({
+            error: 'Не удалось загрузить аватарку'
+        });
+    }
+});
+
+
 // === ЗАПУСК СЕРВЕРА ===
 const PORT = 5001;
 server.listen(PORT, () => {
