@@ -478,7 +478,11 @@ app.post('/api/channels', authenticateToken, async(req, res) => {
         });
 
         // Отправляем событие через сокеты
-        io.emit('channel_created', newChannel);
+        const creatorSocketId = onlineUsers.get(creatorId);
+        if (creatorSocketId) {
+            io.to(creatorSocketId).emit('channel_created', newChannel);
+            console.log(`📢 Канал ${newChannel.id} отправлен создателю ${creatorId}`);
+        }
 
         return res.status(201).json(newChannel);
     } catch (error) {
@@ -786,15 +790,15 @@ io.on('connection', (socket) => {
                             chatId: chatId,
                             lastMessage: newMessage
                         });
-                        // Отправляем счетчик
+                        // ✅ ОТПРАВЛЯЕМ СЧЕТЧИК
                         io.to(socketId).emit('unread_updated', {
                             type: 'chat',
                             id: chatId,
                             count: 1
                         });
+                        console.log(`📊 Отправлен unread_updated для чата ${chatId} участнику ${member.userId}`);
                     }
                 }
-
             } else if (channelId) {
                 // Канал
                 io.to(`channel_${channelId}`).emit('receive_message', newMessage);
@@ -1361,6 +1365,18 @@ app.post('/api/channels/:channelId/members', authenticateToken, async(req, res) 
         });
 
         res.status(201).json(member);
+
+        // ✅ ОТПРАВЛЯЕМ СОБЫТИЕ НОВОМУ УЧАСТНИКУ
+        const newMemberSocketId = onlineUsers.get(userId);
+        if (newMemberSocketId) {
+            io.to(newMemberSocketId).emit('channel_member_added', {
+                channelId: channelId,
+                member: member,
+                channelName: channel.name
+            });
+            console.log(`📢 Событие channel_member_added отправлено пользователю ${userId}`);
+        }
+
     } catch (error) {
         console.error('Ошибка добавления участника в канал:', error);
         res.status(500).json({ error: 'Не удалось добавить участника' });
