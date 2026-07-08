@@ -59,7 +59,7 @@ app.set('prisma', prisma);
 // Регистрируем API-роут для получения истории сообщений
 app.use('/api/messages', messageRoutes);
 
-// ... ОСТАЛЬНОЙ КОД (все остальное без изменений)
+
 
 // Настраиваем хранилище Multer
 const storage = multer.diskStorage({
@@ -144,14 +144,13 @@ const authenticateToken = (req, res, next) => {
 // ==========================================
 // 📊 НЕПРОЧИТАННЫЕ СООБЩЕНИЯ
 // ==========================================
-
 app.get('/api/unread', authenticateToken, async(req, res) => {
     try {
         const userId = req.userId;
         console.log(`📊 Запрос непрочитанных для пользователя ${userId}`);
 
         // ==========================================
-        // 1. ПРИВАТНЫЕ ЧАТЫ
+        // 1. ПРИВАТНЫЕ ЧАТЫ - ИСПРАВЛЕННАЯ ВЕРСИЯ
         // ==========================================
         const privateMembers = await prisma.privateChatMember.findMany({
             where: {
@@ -170,12 +169,14 @@ app.get('/api/unread', authenticateToken, async(req, res) => {
             const lastReadTime = member.lastReadAt || new Date(0);
             console.log(`   Проверяю чат с пользователем ${otherUserId}, lastReadAt: ${lastReadTime}`);
 
+            // ✅ СЧИТАЕМ ТОЛЬКО СООБЩЕНИЯ С СТАТУСОМ 'unread'
             const unreadCount = await prisma.message.count({
                 where: {
                     senderId: otherUserId,
                     receiverId: userId,
                     channelId: null,
                     chatId: null,
+                    status: 'unread', // ✅ ДОБАВЛЯЕМ СТАТУС
                     createdAt: {
                         gt: lastReadTime
                     }
@@ -187,32 +188,6 @@ app.get('/api/unread', authenticateToken, async(req, res) => {
                 privateUnreadCounts[`user_${otherUserId}`] = unreadCount;
             }
         }
-
-        // Сиротские сообщения
-        const orphanMessages = await prisma.message.groupBy({
-            by: ['senderId'],
-            where: {
-                receiverId: userId,
-                channelId: null,
-                chatId: null,
-                senderId: {
-                    notIn: privateMembers.map(m => m.userId === userId ? m.otherUserId : m.userId)
-                }
-            },
-            _count: {
-                id: true
-            }
-        });
-        console.log(`   Сиротских сообщений от ${orphanMessages.length} пользователей`);
-
-        for (const orphan of orphanMessages) {
-            const unreadCount = orphan._count.id;
-            console.log(`      От пользователя ${orphan.senderId}: ${unreadCount} сообщений`);
-            if (unreadCount > 0) {
-                privateUnreadCounts[`user_${orphan.senderId}`] = unreadCount;
-            }
-        }
-
         // ==========================================
         // 2. КАНАЛЫ
         // ==========================================
@@ -230,7 +205,6 @@ app.get('/api/unread', authenticateToken, async(req, res) => {
                 }
             }
         });
-        console.log(`📊 Найдено каналов: ${channelMembers.length}`);
 
         const channelUnreadCounts = {};
         channelMembers.forEach(member => {
@@ -239,14 +213,13 @@ app.get('/api/unread', authenticateToken, async(req, res) => {
                 msg => new Date(msg.createdAt) > new Date(lastRead)
             );
             const count = unreadMessages.length;
-            console.log(`   Канал ${member.channelId} (${member.channel.name}): ${count} непрочитанных`);
             if (count > 0) {
                 channelUnreadCounts[`channel_${member.channelId}`] = count;
             }
         });
 
         // ==========================================
-        // 3. ГРУППОВЫЕ ЧАТЫ
+        // 3. ГРУППОВЫЕ ЧАТЫ - ИСПРАВЛЕННАЯ ВЕРСИЯ
         // ==========================================
         const chatMembers = await prisma.chatMember.findMany({
             where: { userId },
@@ -255,7 +228,8 @@ app.get('/api/unread', authenticateToken, async(req, res) => {
                     include: {
                         messages: {
                             where: {
-                                senderId: { not: userId }
+                                senderId: { not: userId },
+                                status: 'unread' // ✅ ДОБАВЛЯЕМ СТАТУС
                             }
                         }
                     }
@@ -289,7 +263,7 @@ app.get('/api/unread', authenticateToken, async(req, res) => {
         console.log(`📊 ИТОГОВЫЕ счетчики для пользователя ${userId}:`, allUnreadCounts);
         res.json(allUnreadCounts);
     } catch (error) {
-        console.error('Error getting unread counts:', error);
+        console.error('❌ Ошибка получения непрочитанных:', error);
         res.status(500).json({ error: 'Failed to get unread counts' });
     }
 });
@@ -302,7 +276,6 @@ app.post('/api/read', authenticateToken, async(req, res) => {
         console.log(`📖 Отметка о прочтении: type=${type}, id=${id}, userId=${userId}`);
 
         if (!type || !id) {
-            console.error('❌ Не указан type или id');
             return res.status(400).json({ error: 'Не указан type или id' });
         }
 
@@ -319,10 +292,9 @@ app.post('/api/read', authenticateToken, async(req, res) => {
                 }
             });
             console.log(`✅ Отметил прочтение в чате ${id}`);
+
         } else if (type === 'channel') {
             const channelId = parseInt(id);
-            console.log(`🔍 Ищу участника канала ${channelId} с userId ${userId}`);
-
             const member = await prisma.channelMember.findFirst({
                 where: {
                     channelId: channelId,
@@ -331,7 +303,6 @@ app.post('/api/read', authenticateToken, async(req, res) => {
             });
 
             if (!member) {
-                console.log(`⚠️ Участник не найден в канале ${channelId}, создаю...`);
                 await prisma.channelMember.create({
                     data: {
                         channelId: channelId,
@@ -340,22 +311,19 @@ app.post('/api/read', authenticateToken, async(req, res) => {
                         lastReadAt: new Date()
                     }
                 });
-                console.log(`✅ Создана запись участника в канале ${channelId}`);
             } else {
                 await prisma.channelMember.update({
-                    where: {
-                        id: member.id
-                    },
-                    data: {
-                        lastReadAt: new Date()
-                    }
+                    where: { id: member.id },
+                    data: { lastReadAt: new Date() }
                 });
-                console.log(`✅ Обновлен lastReadAt для канала ${channelId}`);
             }
+            console.log(`✅ Обновлен lastReadAt для канала ${channelId}`);
+
         } else if (type === 'private') {
             const otherUserId = parseInt(id);
             console.log(`🔍 Отмечаю прочтение в приватном чате с пользователем ${otherUserId}`);
 
+            // ✅ ОБНОВЛЯЕМ lastReadAt
             const privateMember = await prisma.privateChatMember.findUnique({
                 where: {
                     userId_otherUserId: {
@@ -376,16 +344,13 @@ app.post('/api/read', authenticateToken, async(req, res) => {
                 console.log(`✅ Создана запись приватного чата с ${otherUserId}`);
             } else {
                 await prisma.privateChatMember.update({
-                    where: {
-                        id: privateMember.id
-                    },
-                    data: {
-                        lastReadAt: new Date()
-                    }
+                    where: { id: privateMember.id },
+                    data: { lastReadAt: new Date() }
                 });
                 console.log(`✅ Обновлен lastReadAt для приватного чата с ${otherUserId}`);
             }
 
+            // ✅ ПОМЕЧАЕМ СООБЩЕНИЯ КАК ПРОЧИТАННЫЕ
             await prisma.message.updateMany({
                 where: {
                     senderId: otherUserId,
@@ -467,44 +432,7 @@ app.get('/api/users', authenticateToken, async(req, res) => {
     }
 });
 
-// ==========================================
-// 0.2. МАРШРУТ ДЛЯ ПОЛУЧЕНИЯ СПИСКА ПУБЛИЧНЫХ КАНАЛОВ
-// ==========================================
-app.get('/api/channels', authenticateToken, async(req, res) => {
-    try {
-        console.log('📡 Запрос на получение каналов');
 
-        const channelsList = await prisma.channel.findMany({
-            orderBy: { id: 'asc' },
-            include: {
-                messages: {
-                    orderBy: { createdAt: 'desc' },
-                    take: 1,
-                    include: {
-                        sender: {
-                            select: { id: true, username: true }
-                        }
-                    }
-                }
-            }
-        });
-
-        const channelsWithLastMessage = channelsList.map(channel => {
-            const lastMessage = channel.messages[0] || null;
-            const { messages, ...channelData } = channel;
-            return {
-                ...channelData,
-                lastMessage: lastMessage
-            };
-        });
-
-        console.log(`✅ Отправлено ${channelsWithLastMessage.length} каналов`);
-        return res.json(channelsWithLastMessage);
-    } catch (error) {
-        console.error('❌ Ошибка при получении каналов:', error);
-        return res.status(500).json({ error: 'Ошибка загрузки каналов' });
-    }
-});
 
 // ==========================================
 // СОЗДАНИЕ НОВОГО КАНАЛА
@@ -745,21 +673,33 @@ io.on('connection', (socket) => {
     // === ОТПРАВКА СООБЩЕНИЙ ===
     socket.on('send_message', async(messageData) => {
         try {
-            const { text, mediaUrl, mediaType, activeChatId } = messageData;
+            console.log('📨 Получены данные сообщения:', messageData);
+
+            const { text, mediaUrl, mediaType, activeChatId, isForwarded } = messageData;
             const senderId = socket.userId;
+
+            if (!activeChatId) {
+                console.log('❌ Нет activeChatId');
+                return;
+            }
 
             let receiverId = null;
             let channelId = null;
             let chatId = null;
 
-            if (!activeChatId) return;
-
+            // Определяем тип чата
             if (activeChatId.startsWith('user_')) {
                 receiverId = parseInt(activeChatId.replace('user_', ''), 10);
-                if (isNaN(receiverId)) return;
+                if (isNaN(receiverId)) {
+                    console.log('❌ Невалидный receiverId');
+                    return;
+                }
+                console.log(`📨 Приватный чат с пользователем ${receiverId}`);
+
             } else if (activeChatId.startsWith('channel_')) {
                 channelId = parseInt(activeChatId.replace('channel_', ''), 10);
                 if (isNaN(channelId)) return;
+                console.log(`📨 Канал ${channelId}`);
 
                 const isMember = await prisma.channelMember.findFirst({
                     where: { channelId: channelId, userId: senderId }
@@ -768,10 +708,11 @@ io.on('connection', (socket) => {
                     console.log(`❌ Юзер ${senderId} не участник канала ${channelId}`);
                     return;
                 }
+
             } else if (activeChatId.startsWith('chat_')) {
                 chatId = parseInt(activeChatId.replace('chat_', ''), 10);
-                console.log(`🔍 Определен chatId: ${chatId}`);
                 if (isNaN(chatId)) return;
+                console.log(`📨 Групповой чат ${chatId}`);
 
                 const isMember = await prisma.chatMember.findFirst({
                     where: { chatId: chatId, userId: senderId }
@@ -780,10 +721,14 @@ io.on('connection', (socket) => {
                     console.log(`❌ Юзер ${senderId} не участник чата ${chatId}`);
                     return;
                 }
+            } else {
+                console.log(`❌ Неизвестный тип чата: ${activeChatId}`);
+                return;
             }
 
-            console.log(`🔍 Создаю сообщение: channelId=${channelId}, chatId=${chatId}, receiverId=${receiverId}`);
+            console.log(`📝 Создаю сообщение: text="${text}", chatId=${chatId}, channelId=${channelId}, receiverId=${receiverId}`);
 
+            // ✅ СОХРАНЯЕМ В БАЗУ ДАННЫХ
             const savedMessage = await prisma.message.create({
                 data: {
                     text: text || null,
@@ -793,107 +738,17 @@ io.on('connection', (socket) => {
                     receiverId: receiverId,
                     channelId: channelId,
                     chatId: chatId,
-                    isForwarded: messageData.isForwarded || false
+                    isForwarded: isForwarded || false,
+                    status: 'unread' // ✅ ДОБАВЛЯЕМ СТАТУС
                 },
                 include: {
                     sender: { select: { id: true, username: true } }
                 }
             });
 
-            // ==========================================
-            // 📝 ОБНОВЛЯЕМ ПОСЛЕДНЕЕ СООБЩЕНИЕ ДЛЯ КАНАЛОВ
-            // ==========================================
-            if (channelId) {
-                await prisma.channel.update({
-                    where: { id: channelId },
-                    data: {
-                        lastMessageId: savedMessage.id,
-                        updatedAt: new Date()
-                    }
-                });
-                console.log(`📝 Обновлен lastMessageId для канала ${channelId}`);
+            console.log(`✅ Сообщение ${savedMessage.id} сохранено в БД`);
 
-                const updatedChannel = await prisma.channel.findUnique({
-                    where: { id: channelId },
-                    include: {
-                        messages: {
-                            orderBy: { createdAt: 'desc' },
-                            take: 1,
-                            include: {
-                                sender: {
-                                    select: { id: true, username: true }
-                                }
-                            }
-                        }
-                    }
-                });
-
-                const lastMessage = updatedChannel.messages[0] || null;
-
-                const members = await prisma.channelMember.findMany({
-                    where: { channelId: channelId },
-                    select: { userId: true }
-                });
-
-                for (const member of members) {
-                    const socketId = onlineUsers.get(member.userId);
-                    if (socketId) {
-                        io.to(socketId).emit('channel_updated', {
-                            channelId: channelId,
-                            lastMessage: lastMessage
-                        });
-                        console.log(`📤 Отправлено обновление канала участнику ${member.userId}`);
-                    }
-                }
-            }
-
-            // ==========================================
-            // 📝 ОБНОВЛЯЕМ ПОСЛЕДНЕЕ СООБЩЕНИЕ ДЛЯ ГРУППОВЫХ ЧАТОВ
-            // ==========================================
-            if (chatId) {
-                await prisma.chat.update({
-                    where: { id: chatId },
-                    data: {
-                        lastMessageId: savedMessage.id,
-                        updatedAt: new Date()
-                    }
-                });
-                console.log(`📝 Обновлен lastMessageId для чата ${chatId}`);
-
-                const updatedChat = await prisma.chat.findUnique({
-                    where: { id: chatId },
-                    include: {
-                        messages: {
-                            orderBy: { createdAt: 'desc' },
-                            take: 1,
-                            include: {
-                                sender: {
-                                    select: { id: true, username: true }
-                                }
-                            }
-                        }
-                    }
-                });
-
-                const lastMessage = updatedChat.messages[0] || null;
-
-                const members = await prisma.chatMember.findMany({
-                    where: { chatId: chatId },
-                    select: { userId: true }
-                });
-
-                for (const member of members) {
-                    const socketId = onlineUsers.get(member.userId);
-                    if (socketId) {
-                        io.to(socketId).emit('chat_updated', {
-                            chatId: chatId,
-                            lastMessage: lastMessage
-                        });
-                        console.log(`📤 Отправлено обновление чата участнику ${member.userId}`);
-                    }
-                }
-            }
-
+            // Формируем ответ
             const newMessage = {
                 id: savedMessage.id,
                 text: savedMessage.text,
@@ -910,78 +765,85 @@ io.on('connection', (socket) => {
                 isForwarded: savedMessage.isForwarded || false
             };
 
-            console.log(`📤 Отправляю сообщение:`, { id: newMessage.id, text: newMessage.text });
-
             // ==========================================
             // 📨 РАССЫЛАЕМ СООБЩЕНИЕ
             // ==========================================
             if (chatId) {
+                // Групповой чат
                 io.to(`chat_${chatId}`).emit('receive_message', newMessage);
-            } else if (channelId) {
-                io.to(`channel_${channelId}`).emit('receive_message', newMessage);
-            } else if (receiverId) {
-                const targetSocketId = onlineUsers.get(receiverId);
-                socket.emit('receive_message', newMessage);
-                if (targetSocketId) {
-                    io.to(targetSocketId).emit('receive_message', newMessage);
-                }
-            } else {
-                io.to('chat_general').emit('receive_message', newMessage);
-            }
+                console.log(`📤 Отправлено в групповой чат ${chatId}`);
 
-            // ==========================================
-            // 📊 ОБНОВЛЯЕМ НЕПРОЧИТАННЫЕ
-            // ==========================================
-            if (chatId) {
+                // Обновляем lastMessage для всех участников
                 const members = await prisma.chatMember.findMany({
                     where: { chatId: chatId },
                     select: { userId: true }
                 });
+
                 for (const member of members) {
-                    if (member.userId !== senderId) {
-                        const socketId = onlineUsers.get(member.userId);
-                        if (socketId) {
-                            io.to(socketId).emit('unread_updated', {
-                                type: 'chat',
-                                id: chatId,
-                                count: 1
-                            });
-                        }
+                    const socketId = onlineUsers.get(member.userId);
+                    if (socketId && member.userId !== senderId) {
+                        io.to(socketId).emit('chat_updated', {
+                            chatId: chatId,
+                            lastMessage: newMessage
+                        });
+                        // Отправляем счетчик
+                        io.to(socketId).emit('unread_updated', {
+                            type: 'chat',
+                            id: chatId,
+                            count: 1
+                        });
                     }
                 }
+
             } else if (channelId) {
+                // Канал
+                io.to(`channel_${channelId}`).emit('receive_message', newMessage);
+                console.log(`📤 Отправлено в канал ${channelId}`);
+
+                // ✅ ДОБАВЛЯЕМ ОБНОВЛЕНИЕ ДЛЯ ВСЕХ УЧАСТНИКОВ КАНАЛА
                 const members = await prisma.channelMember.findMany({
                     where: { channelId: channelId },
                     select: { userId: true }
                 });
-                console.log(`📊 Найдено ${members.length} участников канала ${channelId}`);
+
                 for (const member of members) {
-                    if (member.userId !== senderId) {
-                        const socketId = onlineUsers.get(member.userId);
-                        if (socketId) {
-                            console.log(`📊 Отправляю unread_updated участнику ${member.userId}`);
-                            io.to(socketId).emit('unread_updated', {
-                                type: 'channel',
-                                id: channelId,
-                                count: 1
-                            });
-                        }
+                    const socketId = onlineUsers.get(member.userId);
+                    if (socketId && member.userId !== senderId) {
+                        // Отправляем обновление канала (lastMessage)
+                        io.to(socketId).emit('channel_updated', {
+                            channelId: channelId,
+                            lastMessage: newMessage
+                        });
+                        // ✅ ОТПРАВЛЯЕМ СЧЕТЧИК НЕПРОЧИТАННЫХ
+                        io.to(socketId).emit('unread_updated', {
+                            type: 'channel',
+                            id: channelId,
+                            count: 1
+                        });
+                        console.log(`📊 Отправлен unread_updated для канала ${channelId} участнику ${member.userId}`);
                     }
                 }
+
             } else if (receiverId) {
+                // Приватный чат
                 const targetSocketId = onlineUsers.get(receiverId);
+                socket.emit('receive_message', newMessage);
                 if (targetSocketId) {
+                    io.to(targetSocketId).emit('receive_message', newMessage);
                     io.to(targetSocketId).emit('unread_updated', {
                         type: 'private',
                         id: senderId,
                         count: 1
                     });
                 }
+                console.log(`📤 Отправлено в приватный чат с ${receiverId}`);
             }
 
-            console.log(`✅ Сообщение ${savedMessage.id} сохранено и разослано`);
+            console.log(`✅ Сообщение ${savedMessage.id} разослано`);
+
         } catch (error) {
             console.error('❌ Ошибка в send_message:', error);
+            console.error('❌ Стек ошибки:', error.stack);
         }
     });
 
@@ -1070,12 +932,113 @@ io.on('connection', (socket) => {
 
             console.log(`👁️ Юзер ${myId} прочитал историю чата: ${activeChatId}`);
 
+            // ✅ ИСПОЛЬЗУЕМ ТУ ЖЕ ЛОГИКУ, ЧТО И В /api/read
+            let type, id;
+
+            if (activeChatId.startsWith('channel_')) {
+                type = 'channel';
+                id = parseInt(activeChatId.replace('channel_', ''), 10);
+            } else if (activeChatId.startsWith('chat_')) {
+                type = 'chat';
+                id = parseInt(activeChatId.replace('chat_', ''), 10);
+            } else if (activeChatId.startsWith('user_')) {
+                type = 'private';
+                id = parseInt(activeChatId.replace('user_', ''), 10);
+            } else {
+                // Общий чат — ничего не делаем
+                console.log('📖 Общий чат, пропускаем');
+                return;
+            }
+
+            // ✅ ВЫЗЫВАЕМ ТУ ЖЕ ЛОГИКУ, ЧТО И В HTTP-ЭНДПОИНТЕ
+            if (type === 'chat') {
+                await prisma.chatMember.update({
+                    where: {
+                        chatId_userId: {
+                            chatId: id,
+                            userId: myId
+                        }
+                    },
+                    data: {
+                        lastReadAt: new Date()
+                    }
+                });
+                console.log(`✅ Отметил прочтение в чате ${id}`);
+
+            } else if (type === 'channel') {
+                const member = await prisma.channelMember.findFirst({
+                    where: {
+                        channelId: id,
+                        userId: myId
+                    }
+                });
+
+                if (!member) {
+                    await prisma.channelMember.create({
+                        data: {
+                            channelId: id,
+                            userId: myId,
+                            role: 'member',
+                            lastReadAt: new Date()
+                        }
+                    });
+                    console.log(`✅ Создана запись участника в канале ${id}`);
+                } else {
+                    await prisma.channelMember.update({
+                        where: { id: member.id },
+                        data: { lastReadAt: new Date() }
+                    });
+                    console.log(`✅ Обновлен lastReadAt для канала ${id}`);
+                }
+
+            } else if (type === 'private') {
+                const privateMember = await prisma.privateChatMember.findUnique({
+                    where: {
+                        userId_otherUserId: {
+                            userId: myId,
+                            otherUserId: id
+                        }
+                    }
+                });
+
+                if (!privateMember) {
+                    await prisma.privateChatMember.create({
+                        data: {
+                            userId: myId,
+                            otherUserId: id,
+                            lastReadAt: new Date()
+                        }
+                    });
+                    console.log(`✅ Создана запись приватного чата с ${id}`);
+                } else {
+                    await prisma.privateChatMember.update({
+                        where: { id: privateMember.id },
+                        data: { lastReadAt: new Date() }
+                    });
+                    console.log(`✅ Обновлен lastReadAt для приватного чата с ${id}`);
+                }
+
+                await prisma.message.updateMany({
+                    where: {
+                        senderId: id,
+                        receiverId: myId,
+                        channelId: null,
+                        chatId: null,
+                        status: { not: 'read' }
+                    },
+                    data: {
+                        status: 'read'
+                    }
+                });
+                console.log(`✅ Все сообщения от ${id} отмечены как прочитанные`);
+            }
+
             const readPayload = { activeChatId, readerId: myId };
 
+            // Рассылаем уведомления
             if (activeChatId.startsWith('channel_')) {
                 const cleanId = parseInt(activeChatId.replace('channel_', ''), 10);
                 io.to(`channel_${cleanId}`).emit('messages_read_update', readPayload);
-                console.log(`✅ Отправлено уведомление о прочтении в канал ${cleanId}`);
             } else if (activeChatId.startsWith('user_')) {
                 const cleanId = parseInt(activeChatId.replace('user_', ''), 10);
                 socket.emit('messages_read_update', readPayload);
@@ -1083,15 +1046,15 @@ io.on('connection', (socket) => {
                 if (targetSocketId) {
                     io.to(targetSocketId).emit('messages_read_update', readPayload);
                 }
-                console.log(`✅ Отправлено уведомление о прочтении в приватный чат с ${cleanId}`);
             } else {
                 io.to('chat_general').emit('messages_read_update', readPayload);
-                console.log(`✅ Отправлено уведомление о прочтении в Общий чат`);
             }
+
         } catch (err) {
-            console.error('Ошибка в обработчике read_messages:', err);
+            console.error('❌ Ошибка в read_messages:', err);
         }
     });
+
 
     // === СТАТУС ПЕЧАТАНИЯ ===
     socket.on('typing', (data) => {
@@ -1283,7 +1246,6 @@ io.on('connection', (socket) => {
 // ==========================================
 // 4. УЧАСТНИКИ КАНАЛОВ
 // ==========================================
-
 app.get('/api/channels/:channelId/members', authenticateToken, async(req, res) => {
     try {
         const channelId = parseInt(req.params.channelId);
@@ -1304,6 +1266,48 @@ app.get('/api/channels/:channelId/members', authenticateToken, async(req, res) =
     }
 });
 
+app.get('/api/channels', authenticateToken, async(req, res) => {
+    try {
+        const userId = req.userId;
+        console.log(`📡 Запрос каналов для пользователя ${userId}`);
+
+        // ✅ Получаем только каналы, где пользователь является участником
+        const channelMembers = await prisma.channelMember.findMany({
+            where: { userId: userId },
+            include: {
+                channel: {
+                    include: {
+                        messages: {
+                            orderBy: { createdAt: 'desc' },
+                            take: 1,
+                            include: {
+                                sender: {
+                                    select: { id: true, username: true }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        const channelsWithLastMessage = channelMembers.map(member => {
+            const channel = member.channel;
+            const lastMessage = channel.messages[0] || null;
+            const { messages, ...channelData } = channel;
+            return {
+                ...channelData,
+                lastMessage: lastMessage
+            };
+        });
+
+        console.log(`✅ Отправлено ${channelsWithLastMessage.length} каналов для пользователя ${userId}`);
+        return res.json(channelsWithLastMessage);
+    } catch (error) {
+        console.error('❌ Ошибка при получении каналов:', error);
+        return res.status(500).json({ error: 'Ошибка загрузки каналов' });
+    }
+});
 app.post('/api/channels/:channelId/members', authenticateToken, async(req, res) => {
     try {
         const channelId = parseInt(req.params.channelId);
@@ -1362,6 +1366,50 @@ app.post('/api/channels/:channelId/members', authenticateToken, async(req, res) 
         res.status(500).json({ error: 'Не удалось добавить участника' });
     }
 });
+// ==========================================
+// ПОЛУЧЕНИЕ ОДНОГО КАНАЛА
+// ==========================================
+app.get('/api/channels/:channelId', authenticateToken, async(req, res) => {
+    try {
+        const channelId = parseInt(req.params.channelId);
+        const userId = req.userId;
+
+        // Проверяем, что пользователь участник
+        const member = await prisma.channelMember.findFirst({
+            where: {
+                channelId: channelId,
+                userId: userId
+            }
+        });
+
+        if (!member) {
+            return res.status(403).json({ error: 'Вы не участник этого канала' });
+        }
+
+        const channel = await prisma.channel.findUnique({
+            where: { id: channelId },
+            include: {
+                messages: {
+                    orderBy: { createdAt: 'desc' },
+                    take: 1,
+                    include: {
+                        sender: {
+                            select: { id: true, username: true }
+                        }
+                    }
+                }
+            }
+        });
+
+        const lastMessage = channel.messages[0] || null;
+        const { messages, ...channelData } = channel;
+        res.json({...channelData, lastMessage });
+    } catch (error) {
+        console.error('Ошибка получения канала:', error);
+        res.status(500).json({ error: 'Ошибка загрузки канала' });
+    }
+});
+
 
 app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async(req, res) => {
     try {
@@ -1401,6 +1449,25 @@ app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async(
                 }
             }
         });
+
+        // 👇 ПОСЛЕ ЭТОЙ СТРОКИ (await prisma.channelMember.delete) ВСТАВЬ ЭТОТ КОД:
+
+        // Отправляем событие удаленному пользователю
+        const removedUserSocketId = onlineUsers.get(userId);
+        if (removedUserSocketId) {
+            // Отписываем от комнаты, чтобы не получал сообщения
+            const socket = io.sockets.sockets.get(removedUserSocketId);
+            if (socket) {
+                socket.leave(`channel_${channelId}`);
+                console.log(`🚪 Пользователь ${userId} отписан от комнаты channel_${channelId}`);
+            }
+            // Отправляем уведомление о кике
+            io.to(removedUserSocketId).emit('kicked_from_channel', {
+                channelId: channelId,
+                channelName: channel.name
+            });
+            console.log(`👢 Пользователь ${userId} удален из канала ${channelId}, отправлено уведомление`);
+        }
 
         res.json({ success: true, message: 'Участник удален из канала' });
     } catch (error) {
@@ -1462,6 +1529,10 @@ app.post('/api/chats', authenticateToken, async(req, res) => {
                 }
             }
         });
+
+        // ✅ ДОБАВЬ ЭТУ СТРОКУ
+        io.emit('chat_created', newChat);
+        console.log(`👥 Создан новый групповой чат: ${newChat.id}`);
 
         res.status(201).json({
             id: `chat_${newChat.id}`,
@@ -1582,6 +1653,14 @@ app.post('/api/chats/:chatId/members', authenticateToken, async(req, res) => {
             }
         });
 
+        // Отправляем событие всем участникам чата
+        io.emit('chat_member_added', {
+            chatId: chatId,
+            member: member,
+            chatName: chat.name
+        });
+        console.log(`➕ Пользователь ${userId} добавлен в чат ${chatId}, отправлено уведомление`);
+
         res.status(201).json(member);
     } catch (error) {
         console.error('Ошибка добавления участника в чат:', error);
@@ -1616,6 +1695,13 @@ app.delete('/api/chats/:chatId/members/:userId', authenticateToken, async(req, r
             }
         });
 
+        io.emit('chat_member_removed', {
+            chatId: chatId,
+            userId: userId,
+            chatName: chat.name
+        });
+        console.log(`👢 Пользователь ${userId} удален из чата ${chatId}, отправлено уведомление`);
+
         res.json({ success: true, message: 'Участник удален из чата' });
     } catch (error) {
         console.error('Ошибка удаления участника из чата:', error);
@@ -1623,6 +1709,9 @@ app.delete('/api/chats/:chatId/members/:userId', authenticateToken, async(req, r
     }
 });
 
+// ==========================================
+// УДАЛЕНИЕ ГРУППОВОГО ЧАТА
+// ==========================================
 app.delete('/api/chats/:chatId', authenticateToken, async(req, res) => {
     try {
         const chatId = parseInt(req.params.chatId);
@@ -1644,9 +1733,9 @@ app.delete('/api/chats/:chatId', authenticateToken, async(req, res) => {
             where: { id: chatId }
         });
 
-        io.emit('chat_deleted', { chatId });
-
+        io.emit('chat_deleted', { chatId: chatId });
         console.log(`🗑️ Групповой чат ${chatId} удален пользователем ${userId}`);
+
         res.json({ success: true, message: 'Чат удален' });
 
     } catch (error) {
