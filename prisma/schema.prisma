@@ -38,16 +38,19 @@ model Message {
   updatedAt   DateTime @updatedAt
   
   senderId    Int
-  sender      User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
   receiverId  Int?     
   channelId   Int?
-  channel     Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
   chatId      Int?
-  chat        Chat?    @relation(fields: [chatId], references: [id], onDelete: Cascade)
   
   isForwarded Boolean? @default(false)  
   isPinned    Boolean? @default(false)
   edited      Boolean? @default(false) 
+  isDeleted   Boolean? @default(false)  
+  
+  
+  sender      User     @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  channel     Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  chat        Chat?    @relation(fields: [chatId], references: [id], onDelete: Cascade)
   
   threads     Thread[]
   reactions   Reaction[]
