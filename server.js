@@ -1467,63 +1467,80 @@ io.on('connection', (socket) => {
     });
 
 
-    socket.on('add_member', async(data) => {
-        console.log(`📤 [SERVER] Получен запрос на добавление участника:`, data);
+ socket.on('add_member', async(data) => {
+    console.log(`📤 [SERVER] Получен запрос на добавление участника:`, data);
 
-        const { chatId, userId, chatType } = data;
+    const { chatId, userId, chatType } = data;
 
-        try {
-            let cleanId;
-            let roomName;
+    try {
+        let cleanId;
+        let roomName;
 
-            if (chatId.startsWith('chat_')) {
-                cleanId = parseInt(chatId.replace('chat_', ''));
-                roomName = `chat_${cleanId}`;
-            } else if (chatId.startsWith('channel_')) {
-                cleanId = parseInt(chatId.replace('channel_', ''));
-                roomName = `channel_${cleanId}`;
-            } else {
-                cleanId = parseInt(chatId);
-                roomName = `chat_${cleanId}`;
-            }
-
-            // ✅ ТОЛЬКО ДЛЯ ГРУППОВЫХ ЧАТОВ
-            if (chatType === 'group') {
-                // Получаем данные нового участника
-                const newMember = await prisma.chatMember.findUnique({
-                    where: {
-                        chatId_userId: {
-                            chatId: cleanId,
-                            userId: userId
-                        }
-                    },
-                    include: {
-                        user: {
-                            select: { id: true, username: true, avatar: true }
-                        }
-                    }
-                });
-
-                console.log(`🔍 [SERVER] Найден участник:`, newMember);
-
-                if (newMember) {
-                    console.log(`📤 [SERVER] Отправляю chat_member_added в комнату ${roomName}`);
-                    // ✅ ВАЖНО: отправляем ВСЕМ в комнате
-                    io.to(roomName).emit('chat_member_added', {
-                        chatId: cleanId,
-                        member: newMember
-                    });
-                    console.log(`✅ [SERVER] Отправлено chat_member_added в комнату ${roomName}`);
-                } else {
-                    console.log(`⚠️ [SERVER] Участник ${userId} не найден в чате ${cleanId}`);
-                }
-            }
-
-        } catch (error) {
-            console.error('❌ [SERVER] Ошибка в add_member:', error);
+        if (chatId.startsWith('chat_')) {
+            cleanId = parseInt(chatId.replace('chat_', ''));
+            roomName = `chat_${cleanId}`;
+        } else if (chatId.startsWith('channel_')) {
+            cleanId = parseInt(chatId.replace('channel_', ''));
+            roomName = `channel_${cleanId}`;
+        } else {
+            cleanId = parseInt(chatId);
+            roomName = `chat_${cleanId}`;
         }
-    });
 
+        // ✅ ДЛЯ ГРУППОВЫХ ЧАТОВ
+        if (chatType === 'group') {
+            const newMember = await prisma.chatMember.findUnique({
+                where: {
+                    chatId_userId: {
+                        chatId: cleanId,
+                        userId: userId
+                    }
+                },
+                include: {
+                    user: {
+                        select: { id: true, username: true, avatar: true }
+                    }
+                }
+            });
+
+            if (newMember) {
+                console.log(`📤 [SERVER] Отправляю chat_member_added в комнату ${roomName}`);
+                io.to(roomName).emit('chat_member_added', {
+                    chatId: cleanId,
+                    member: newMember
+                });
+            }
+        }
+
+        // ✅ ДЛЯ КАНАЛОВ (ДОБАВЛЯЕМ!)
+        if (chatType === 'channel') {
+            const newMember = await prisma.channelMember.findUnique({
+                where: {
+                    channelId_userId: {
+                        channelId: cleanId,
+                        userId: userId
+                    }
+                },
+                include: {
+                    user: {
+                        select: { id: true, username: true, avatar: true }
+                    }
+                }
+            });
+
+            if (newMember) {
+                console.log(`📤 [SERVER] Отправляю channel_member_added в комнату ${roomName}`);
+                io.to(roomName).emit('channel_member_added', {
+                    channelId: cleanId,
+                    member: newMember
+                });
+            }
+        }
+
+    } catch (error) {
+        console.error('❌ [SERVER] Ошибка в add_member:', error);
+    }
+});
     // === ТРЕДЫ ===
     socket.on('create_thread', async({ messageId, text, activeChatId }) => {
         try {
