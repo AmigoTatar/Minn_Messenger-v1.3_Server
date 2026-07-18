@@ -172,7 +172,7 @@ const upload = multer({
     storage: storage,
     limits: { fileSize: 10 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
-        const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.pdf', '.bmp', '.doc', '.docx', '.txt', '.mp3', '.mp4'];
+        const allowedExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.pdf', '.bmp', '.doc', '.docx', '.txt', '.mp3', '.mp4', '.webm', '.ogg', '.wav', '.aac'];
         const ext = path.extname(file.originalname).toLowerCase();
         if (!allowedExtensions.includes(ext)) {
             return cb(new Error('Недопустимый тип файла. Разрешены только изображения, документы и медиа.'));
@@ -1252,7 +1252,7 @@ io.on('connection', (socket) => {
 
     // === СТАТУС ПЕЧАТАНИЯ ===
     socket.on('typing', (data) => {
-        console.log('📝 [SERVER] ПОЛУЧЕНО typing:', data);
+        console.log('📝 [SERVER] typing от', socket.userId, 'в чат', data.activeChatId);
         if (!data || !data.activeChatId) {
             console.log('❌ [SERVER] Нет activeChatId');
             return;
@@ -1386,6 +1386,17 @@ io.on('connection', (socket) => {
 
                 // Отправляем событие всем в комнате
                 console.log(`📤 [SERVER] Отправляю chat_member_removed в комнату ${roomName} для userId ${userId}`);
+
+                // Отправляем событие лично удалённому пользователю
+const removedUserSocketId = onlineUsers.get(userId);
+if (removedUserSocketId) {
+    io.to(removedUserSocketId).emit('chat_member_removed', {
+        chatId: cleanId,
+        userId: userId,
+        chatName: 'Групповой чат'
+    });
+    console.log(`👢 Личное уведомление отправлено пользователю ${userId}`);
+}
                 io.to(roomName).emit('chat_member_removed', {
                     chatId: cleanId,
                     userId: userId,
@@ -1773,19 +1784,43 @@ app.post('/api/channels/:channelId/members', authenticateToken, async(req, res) 
             }
         });
 
-        res.status(201).json(member);
+        // ✅ Получаем полные данные канала для нового участника
+        const fullChannel = await prisma.channel.findUnique({
+            where: { id: channelId },
+            include: {
+                messages: {
+                    orderBy: { createdAt: 'desc' },
+                    take: 1,
+                    include: { sender: { select: { id: true, username: true } } }
+                }
+            }
+        });
+        const lastMessage = fullChannel.messages[0] || null;
+        const allMembers = await prisma.channelMember.findMany({
+            where: { channelId },
+            include: { user: { select: { id: true, username: true, avatar: true } } }
+        });
+        const channelData = {
+            ...fullChannel,
+            lastMessage,
+            members: allMembers
+        };
 
-        // ✅ ОТПРАВЛЯЕМ СОБЫТИЕ НОВОМУ УЧАСТНИКУ
+        // ✅ Отправляем событие новому участнику
         const newMemberSocketId = onlineUsers.get(userId);
         if (newMemberSocketId) {
-            io.to(newMemberSocketId).emit('channel_member_added', {
-                channelId: channelId,
-                member: member,
-                channelName: channel.name
-            });
-            console.log(`📢 Событие channel_member_added отправлено пользователю ${userId}`);
+            io.to(newMemberSocketId).emit('channel_created', channelData);
+            console.log(`📢 Канал ${channelId} отправлен новому участнику ${userId}`);
         }
 
+        // ✅ Отправляем событие остальным (для обновления списка участников)
+        io.to(`channel_${channelId}`).emit('channel_member_added', {
+            channelId: channelId,
+            member: member,
+            channelName: channel.name
+        });
+
+        res.status(201).json(member);
     } catch (error) {
         console.error('Ошибка добавления участника в канал:', error);
         res.status(500).json({ error: 'Не удалось добавить участника' });
@@ -1955,7 +1990,7 @@ app.post('/api/chats', authenticateToken, async(req, res) => {
             }
         });
 
-        // ✅ ДОБАВЬ ЭТУ СТРОКУ
+    console.log(`📤 Отправляю chat_created для чата ${chat.id} всем клиентам`);
         io.emit('chat_created', newChat);
         console.log(`👥 Создан новый групповой чат: ${newChat.id}`);
 
@@ -2129,7 +2164,24 @@ app.delete('/api/chats/:chatId/members/:userId', authenticateToken, async(req, r
             }
         });
 
+        // ✅ Отправляем событие удалённому пользователю (через socket)
+        const removedUserSocketId = onlineUsers.get(userId);
+        if (removedUserSocketId) {
+            io.to(removedUserSocketId).emit('chat_member_removed', {
+                chatId: chatId,
+                userId: userId,
+                chatName: chat.name
+            });
+            console.log(`👢 Личное уведомление отправлено пользователю ${userId}`);
+        }
 
+        // ✅ Отправляем событие остальным участникам (в комнату)
+        io.to(`chat_${chatId}`).emit('chat_member_removed', {
+            chatId: chatId,
+            userId: userId,
+            chatName: chat.name
+        });
+        console.log(`📤 Отправлено chat_member_removed в комнату chat_${chatId}`);
 
         res.json({ success: true, message: 'Участник удален из чата' });
     } catch (error) {
