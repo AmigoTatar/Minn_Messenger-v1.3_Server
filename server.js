@@ -2572,11 +2572,16 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
         const messageId = parseInt(req.params.messageId);
         const userId = req.userId;
 
+        console.log('📌 Закрепление: messageId=', messageId, 'userId=', userId);
+
         const message = await prisma.message.findUnique({
             where: { id: messageId },
             include: {
                 chat: true,
-                channel: true
+                channel: true,
+                sender: {
+                    select: { id: true, username: true, avatar: true }
+                }
             }
         });
 
@@ -2586,21 +2591,34 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
 
         let canPin = false;
 
+        // 1. Автор всегда может закрепить своё сообщение
         if (message.senderId === userId) {
             canPin = true;
         }
 
+        // 2. Для каналов: создатель и админы
         if (message.channelId) {
-            const isAdmin = await prisma.channelMember.findFirst({
-                where: {
-                    channelId: message.channelId,
-                    userId: userId,
-                    role: 'admin'
-                }
+            // Проверяем, является ли пользователь создателем канала
+            const channel = await prisma.channel.findUnique({
+                where: { id: message.channelId }
             });
-            if (isAdmin) canPin = true;
+            if (channel && channel.creatorId === userId) {
+                canPin = true;
+            }
+            // Если не создатель, проверяем роль admin
+            if (!canPin) {
+                const isAdmin = await prisma.channelMember.findFirst({
+                    where: {
+                        channelId: message.channelId,
+                        userId: userId,
+                        role: 'admin'
+                    }
+                });
+                if (isAdmin) canPin = true;
+            }
         }
 
+        // 3. Для групповых чатов: создатель
         if (message.chatId) {
             const chat = await prisma.chat.findUnique({
                 where: { id: message.chatId }
@@ -2612,10 +2630,11 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
 
         if (!canPin) {
             return res.status(403).json({
-                error: 'Только автор, админ или создатель чата может закреплять сообщения'
+                error: 'Только автор, админ или создатель чата/канала может закреплять сообщения'
             });
         }
 
+        console.log('✅ Права есть, обновляю сообщение');
         const updatedMessage = await prisma.message.update({
             where: { id: messageId },
             data: {
@@ -2627,12 +2646,30 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
                 }
             }
         });
+        console.log('✅ Сообщение обновлено, isPinned=', updatedMessage.isPinned);
 
-        const chatRoom = message.channelId ?
-            `channel_${message.channelId}` :
-            message.chatId ?
-            `chat_${message.chatId}` :
-            null;
+        // Отправляем событие в зависимости от типа чата
+        let chatRoom = null;
+        if (message.channelId) {
+            chatRoom = `channel_${message.channelId}`;
+        } else if (message.chatId) {
+            chatRoom = `chat_${message.chatId}`;
+        } else {
+            // Приватный чат – отправляем обоим участникам
+            const senderRoom = `user_${message.senderId}`;
+            const receiverRoom = `user_${message.receiverId}`;
+            console.log('📤 Отправляю событие в приватные комнаты:', senderRoom, receiverRoom);
+            io.to(senderRoom).emit('message_pinned', {
+                messageId: messageId,
+                isPinned: updatedMessage.isPinned,
+                message: updatedMessage
+            });
+            io.to(receiverRoom).emit('message_pinned', {
+                messageId: messageId,
+                isPinned: updatedMessage.isPinned,
+                message: updatedMessage
+            });
+        }
 
         if (chatRoom) {
             io.to(chatRoom).emit('message_pinned', {
@@ -2647,12 +2684,13 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
             isPinned: updatedMessage.isPinned,
             message: updatedMessage
         });
-
     } catch (error) {
         console.error('❌ Ошибка закрепления сообщения:', error);
         res.status(500).json({ error: 'Не удалось закрепить сообщение' });
     }
 });
+
+
 
 // ✅ ПОЛУЧЕНИЕ ЗАКРЕПЛЕННЫХ СООБЩЕНИЙ
 app.get('/api/messages/pinned', authenticateToken, async(req, res) => {
