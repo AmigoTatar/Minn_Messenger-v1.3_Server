@@ -56,7 +56,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Общий лимит для всех запросов (базовая защита)
 const globalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 минут
-    max: 500, // 500 запросов
+    max: 1000, // 1000 запросов
     message: { error: 'Слишком много запросов, попробуйте позже' },
     standardHeaders: true,
     legacyHeaders: false
@@ -2591,32 +2591,51 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
 
         let canPin = false;
 
-        // 1. Автор всегда может закрепить своё сообщение
-        if (message.senderId === userId) {
-            canPin = true;
-        }
+// Приватные чаты: автор всегда может закрепить
+if (message.senderId === userId) {
+    canPin = true;
+    console.log('✅ Автор сообщения');
+}
 
-        // 2. Для каналов: создатель и админы
-        if (message.channelId) {
-            // Проверяем, является ли пользователь создателем канала
-            const channel = await prisma.channel.findUnique({
-                where: { id: message.channelId }
-            });
-            if (channel && channel.creatorId === userId) {
-                canPin = true;
+// Каналы: создатель или админ
+if (!canPin && message.channelId) {
+    const channel = await prisma.channel.findUnique({
+        where: { id: message.channelId }
+    });
+    if (channel && channel.creatorId === userId) {
+        canPin = true;
+        console.log('✅ Создатель канала');
+    }
+    if (!canPin) {
+        const isAdmin = await prisma.channelMember.findFirst({
+            where: {
+                channelId: message.channelId,
+                userId: userId,
+                role: 'admin'
             }
-            // Если не создатель, проверяем роль admin
-            if (!canPin) {
-                const isAdmin = await prisma.channelMember.findFirst({
-                    where: {
-                        channelId: message.channelId,
-                        userId: userId,
-                        role: 'admin'
-                    }
-                });
-                if (isAdmin) canPin = true;
-            }
+        });
+        if (isAdmin) {
+            canPin = true;
+            console.log('✅ Админ канала');
         }
+    }
+}
+
+// Группы: создатель
+if (!canPin && message.chatId) {
+    const chat = await prisma.chat.findUnique({
+        where: { id: message.chatId }
+    });
+    if (chat && chat.creatorId === userId) {
+        canPin = true;
+        console.log('✅ Создатель группы');
+    }
+}
+
+console.log('📌 Итоговое canPin:', canPin);
+if (!canPin) {
+    return res.status(403).json({ error: 'Нет прав на закрепление' });
+}
 
         // 3. Для групповых чатов: создатель
         if (message.chatId) {
@@ -2646,33 +2665,28 @@ app.post('/api/messages/:messageId/pin', authenticateToken, async(req, res) => {
                 }
             }
         });
-        console.log('✅ Сообщение обновлено, isPinned=', updatedMessage.isPinned);
 
         // Отправляем событие в зависимости от типа чата
-        let chatRoom = null;
         if (message.channelId) {
-            chatRoom = `channel_${message.channelId}`;
+            io.to(`channel_${message.channelId}`).emit('message_pinned', {
+                messageId: messageId,
+                isPinned: updatedMessage.isPinned,
+                message: updatedMessage
+            });
         } else if (message.chatId) {
-            chatRoom = `chat_${message.chatId}`;
+            io.to(`chat_${message.chatId}`).emit('message_pinned', {
+                messageId: messageId,
+                isPinned: updatedMessage.isPinned,
+                message: updatedMessage
+            });
         } else {
-            // Приватный чат – отправляем обоим участникам
-            const senderRoom = `user_${message.senderId}`;
-            const receiverRoom = `user_${message.receiverId}`;
-            console.log('📤 Отправляю событие в приватные комнаты:', senderRoom, receiverRoom);
-            io.to(senderRoom).emit('message_pinned', {
+            // Приватный чат
+            io.to(`user_${message.senderId}`).emit('message_pinned', {
                 messageId: messageId,
                 isPinned: updatedMessage.isPinned,
                 message: updatedMessage
             });
-            io.to(receiverRoom).emit('message_pinned', {
-                messageId: messageId,
-                isPinned: updatedMessage.isPinned,
-                message: updatedMessage
-            });
-        }
-
-        if (chatRoom) {
-            io.to(chatRoom).emit('message_pinned', {
+            io.to(`user_${message.receiverId}`).emit('message_pinned', {
                 messageId: messageId,
                 isPinned: updatedMessage.isPinned,
                 message: updatedMessage
@@ -3094,6 +3108,109 @@ app.get('/api/messages/search', authenticateToken, validateSearch, async(req, re
         console.error('❌ Ошибка поиска:', error);
         res.status(500).json({ error: 'Не удалось выполнить поиск' });
     }
+});
+
+// 📝 ИЗМЕНЕНИЕ ГРУППОВОГО ЧАТА
+app.put('/api/chats/:chatId', authenticateToken, async (req, res) => {
+  try {
+    const chatId = parseInt(req.params.chatId);
+    const userId = req.userId;
+    const { name, avatar } = req.body;
+
+    const chat = await prisma.chat.findUnique({
+      where: { id: chatId }
+    });
+
+    if (!chat) {
+      return res.status(404).json({ error: 'Чат не найден' });
+    }
+
+    if (chat.creatorId !== userId) {
+      return res.status(403).json({ error: 'Только создатель может изменять чат' });
+    }
+
+    const updatedChat = await prisma.chat.update({
+      where: { id: chatId },
+      data: {
+        name: name !== undefined ? name.trim() : chat.name,
+        avatar: avatar !== undefined ? avatar : chat.avatar,
+      },
+      include: {
+        members: {
+          include: {
+            user: {
+              select: { id: true, username: true, avatar: true }
+            }
+          }
+        }
+      }
+    });
+
+    // Отправляем событие всем участникам
+    io.to(`chat_${chatId}`).emit('chat_updated', updatedChat);
+
+    res.json(updatedChat);
+  } catch (error) {
+    console.error('Ошибка обновления чата:', error);
+    res.status(500).json({ error: 'Не удалось обновить чат' });
+  }
+});
+
+// 📝 ИЗМЕНЕНИЕ КАНАЛА
+app.put('/api/channels/:channelId', authenticateToken, async (req, res) => {
+  try {
+    const channelId = parseInt(req.params.channelId);
+    const userId = req.userId;
+    const { name, avatar } = req.body;
+
+    const channel = await prisma.channel.findUnique({
+      where: { id: channelId }
+    });
+
+    if (!channel) {
+      return res.status(404).json({ error: 'Канал не найден' });
+    }
+
+    // Создатель или админ может изменять канал
+    const isAdmin = await prisma.channelMember.findFirst({
+      where: {
+        channelId: channelId,
+        userId: userId,
+        role: 'admin'
+      }
+    });
+
+    if (channel.creatorId !== userId && !isAdmin) {
+      return res.status(403).json({ error: 'Только создатель или админ может изменять канал' });
+    }
+
+    const updatedChannel = await prisma.channel.update({
+      where: { id: channelId },
+      data: {
+        name: name !== undefined ? name.trim() : channel.name,
+        avatar: avatar !== undefined ? avatar : channel.avatar,
+      },
+      include: {
+        messages: {
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+          include: { sender: { select: { id: true, username: true } } }
+        }
+      }
+    });
+
+    const lastMessage = updatedChannel.messages[0] || null;
+    const { messages, ...channelData } = updatedChannel;
+    const result = { ...channelData, lastMessage };
+
+    // Отправляем событие всем участникам
+    io.to(`channel_${channelId}`).emit('channel_updated', result);
+
+    res.json(result);
+  } catch (error) {
+    console.error('Ошибка обновления канала:', error);
+    res.status(500).json({ error: 'Не удалось обновить канал' });
+  }
 });
 
 
