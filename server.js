@@ -91,12 +91,20 @@ const sendLimiter = rateLimit({
 
 // Лимит для регистрации и входа (защита от брутфорса)
 const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 минут
-    max: 5, // 5 попыток
-    message: { error: 'Слишком много попыток, подождите 15 минут' },
+    windowMs: 5 * 60 * 1000, // 5 минут
+    max: 20, // 20 попыток (достаточно, чтобы не заблокировать пользователя)
+    message: { error: 'Слишком много попыток входа. Попробуйте через 5 минут.' },
     standardHeaders: true,
     legacyHeaders: false
 });
+
+
+
+// Регистрация – без лимита (чтобы не мешать новым пользователям)
+app.use('/api/auth/register', (req, res, next) => next());
+
+// Вход – с лимитом
+app.use('/api/auth/login', authLimiter);
 
 // Лимит для поиска
 const searchLimiter = rateLimit({
@@ -3111,7 +3119,7 @@ app.get('/api/messages/search', authenticateToken, validateSearch, async(req, re
 });
 
 // 📝 ИЗМЕНЕНИЕ ГРУППОВОГО ЧАТА
-app.put('/api/chats/:chatId', authenticateToken, async (req, res) => {
+app.put('/api/chats/:chatId', authenticateToken,upload.single('avatar'), async (req, res) => {
   try {
     const chatId = parseInt(req.params.chatId);
     const userId = req.userId;
@@ -3157,7 +3165,7 @@ app.put('/api/chats/:chatId', authenticateToken, async (req, res) => {
 });
 
 // 📝 ИЗМЕНЕНИЕ КАНАЛА
-app.put('/api/channels/:channelId', authenticateToken, async (req, res) => {
+app.put('/api/channels/:channelId', authenticateToken,upload.single('avatar'), async (req, res) => {
   try {
     const channelId = parseInt(req.params.channelId);
     const userId = req.userId;
