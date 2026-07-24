@@ -1,4 +1,4 @@
-const isProduction = process.env.NODE_ENV === 'production';
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -48,7 +48,7 @@ app.use(cors({
 // Ограничение размера запросов
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/uploads', express.static('uploads'));
+
 
 // Настройка multer для загрузки файлов
 const storage = multer.diskStorage({
@@ -940,11 +940,19 @@ io.on('connection', (socket) => {
                             lastMessage: newMessage
                         });
                         // ✅ ОТПРАВЛЯЕМ СЧЕТЧИК
-                        io.to(socketId).emit('unread_updated', {
-                            type: 'chat',
-                            id: chatId,
-                            count: 1
-                        });
+                       const unreadCount = await prisma.message.count({
+    where: {
+        chatId: chatId,
+        senderId: { not: member.userId },
+        status: 'unread',
+        createdAt: { gt: member.lastReadAt || new Date(0) }
+    }
+});
+io.to(socketId).emit('unread_updated', {
+    type: 'chat',
+    id: chatId,
+    count: unreadCount
+});
                         console.log(`📊 Отправлен unread_updated для чата ${chatId} участнику ${member.userId}`);
                     }
                 }
@@ -1076,182 +1084,193 @@ io.on('connection', (socket) => {
     });
 
     // === ПРОЧТЕНИЕ СООБЩЕНИЙ ===
-    socket.on('read_messages', async(data) => {
-        try {
-            if (!data) return;
-            const { activeChatId } = data;
-            const myId = socket.userId;
+socket.on('read_messages', async (data) => {
+  try {
+    if (!data) return;
+    const { activeChatId } = data;
+    const myId = socket.userId;
 
-            if (!activeChatId) return;
+    if (!activeChatId) return;
 
-            console.log(`👁️ Юзер ${myId} прочитал историю чата: ${activeChatId}`);
+    console.log(`👁️ Юзер ${myId} прочитал историю чата: ${activeChatId}`);
 
-            // ✅ ДОБАВЛЯЕМ ЗАЩИТУ ОТ ПУСТЫХ ЗНАЧЕНИЙ
-            if (activeChatId === 'chat_general' || activeChatId === 'null' || activeChatId === 'undefined' || !activeChatId) {
-                console.log('📖 Общий чат или пустой ID, пропускаем');
-                return;
-            }
+    if (activeChatId === 'chat_general' || activeChatId === 'null' || activeChatId === 'undefined' || !activeChatId) {
+      console.log('📖 Общий чат или пустой ID, пропускаем');
+      return;
+    }
 
-            let type, id;
+    let type, id;
 
-            if (activeChatId.startsWith('channel_')) {
-                type = 'channel';
-                id = parseInt(activeChatId.replace('channel_', ''), 10);
-            } else if (activeChatId.startsWith('chat_')) {
-                type = 'chat';
-                id = parseInt(activeChatId.replace('chat_', ''), 10);
-            } else if (activeChatId.startsWith('user_')) {
-                type = 'private';
-                id = parseInt(activeChatId.replace('user_', ''), 10);
-            } else {
-                console.log(`⚠️ Неизвестный тип чата: ${activeChatId}, пропускаем`);
-                return;
-            }
+    if (activeChatId.startsWith('channel_')) {
+      type = 'channel';
+      id = parseInt(activeChatId.replace('channel_', ''), 10);
+    } else if (activeChatId.startsWith('chat_')) {
+      type = 'chat';
+      id = parseInt(activeChatId.replace('chat_', ''), 10);
+    } else if (activeChatId.startsWith('user_')) {
+      type = 'private';
+      id = parseInt(activeChatId.replace('user_', ''), 10);
+    } else {
+      console.log(`⚠️ Неизвестный тип чата: ${activeChatId}, пропускаем`);
+      return;
+    }
 
-            // ✅ ПРОВЕРЯЕМ, ЧТО ID - ЧИСЛО
-            if (isNaN(id)) {
-                console.log(`⚠️ Невалидный ID: ${id}, пропускаем`);
-                return;
-            }
+    if (isNaN(id)) {
+      console.log(`⚠️ Невалидный ID: ${id}, пропускаем`);
+      return;
+    }
 
-            // ✅ ВЫЗЫВАЕМ ТУ ЖЕ ЛОГИКУ, ЧТО И В HTTP-ЭНДПОИНТЕ
-            if (type === 'chat') {
-                // ✅ СНАЧАЛА ПРОВЕРЯЕМ, СУЩЕСТВУЕТ ЛИ ЗАПИСЬ
-                const existingMember = await prisma.chatMember.findUnique({
-                    where: {
-                        chatId_userId: {
-                            chatId: id,
-                            userId: myId
-                        }
-                    }
-                });
-                 io.to(`chat_${id}`).emit('messages_read_update', {
-    activeChatId: `chat_${id}`,
-    readerId: myId
-  });
-} else if (type === 'channel') {
-  // ... обновление lastReadAt
-  io.to(`channel_${id}`).emit('messages_read_update', {
-    activeChatId: `channel_${id}`,
-    readerId: myId
-  });
-
-
-                if (!existingMember) {
-                    // Если записи нет — создаем её
-                    await prisma.chatMember.create({
-                        data: {
-                            chatId: id,
-                            userId: myId,
-                            lastReadAt: new Date()
-                        }
-                    });
-                    console.log(`✅ Создана запись участника в чате ${id} для пользователя ${myId}`);
-                } else {
-                    // Если запись есть — обновляем
-                    await prisma.chatMember.update({
-                        where: {
-                            chatId_userId: {
-                                chatId: id,
-                                userId: myId
-                            }
-                        },
-                        data: {
-                            lastReadAt: new Date()
-                        }
-                    });
-                    console.log(`✅ Отметил прочтение в чате ${id}`);
-                }
-
-            } else if (type === 'channel') {
-                const member = await prisma.channelMember.findFirst({
-                    where: {
-                        channelId: id,
-                        userId: myId
-                    }
-                });
-
-                if (!member) {
-                    await prisma.channelMember.create({
-                        data: {
-                            channelId: id,
-                            userId: myId,
-                            role: 'member',
-                            lastReadAt: new Date()
-                        }
-                    });
-                    console.log(`✅ Создана запись участника в канале ${id}`);
-                } else {
-                    await prisma.channelMember.update({
-                        where: { id: member.id },
-                        data: { lastReadAt: new Date() }
-                    });
-                    console.log(`✅ Обновлен lastReadAt для канала ${id}`);
-                }
-
-            } else if (type === 'private') {
-                const privateMember = await prisma.privateChatMember.findUnique({
-                    where: {
-                        userId_otherUserId: {
-                            userId: myId,
-                            otherUserId: id
-                        }
-                    }
-                });
-
-                if (!privateMember) {
-                    await prisma.privateChatMember.create({
-                        data: {
-                            userId: myId,
-                            otherUserId: id,
-                            lastReadAt: new Date()
-                        }
-                    });
-                    console.log(`✅ Создана запись приватного чата с ${id}`);
-                } else {
-                    await prisma.privateChatMember.update({
-                        where: { id: privateMember.id },
-                        data: { lastReadAt: new Date() }
-                    });
-                    console.log(`✅ Обновлен lastReadAt для приватного чата с ${id}`);
-                }
-
-                await prisma.message.updateMany({
-                    where: {
-                        senderId: id,
-                        receiverId: myId,
-                        channelId: null,
-                        chatId: null,
-                        status: { not: 'read' }
-                    },
-                    data: {
-                        status: 'read'
-                    }
-                });
-                console.log(`✅ Все сообщения от ${id} отмечены как прочитанные`);
-            }
-
-            const readPayload = { activeChatId, readerId: myId };
-
-            // Рассылаем уведомления
-            if (activeChatId.startsWith('channel_')) {
-                const cleanId = parseInt(activeChatId.replace('channel_', ''), 10);
-                io.to(`channel_${cleanId}`).emit('messages_read_update', readPayload);
-            } else if (activeChatId.startsWith('user_')) {
-                const cleanId = parseInt(activeChatId.replace('user_', ''), 10);
-                socket.emit('messages_read_update', readPayload);
-                const targetSocketId = onlineUsers.get(cleanId);
-                if (targetSocketId) {
-                    io.to(targetSocketId).emit('messages_read_update', readPayload);
-                }
-            } else {
-                io.to('chat_general').emit('messages_read_update', readPayload);
-            }
-
-        } catch (err) {
-            console.error('❌ Ошибка в read_messages:', err);
+    // --- ОБНОВЛЕНИЕ lastReadAt И СТАТУСА СООБЩЕНИЙ ---
+    if (type === 'chat') {
+      // Обновляем lastReadAt для участника
+      const existingMember = await prisma.chatMember.findUnique({
+        where: {
+          chatId_userId: {
+            chatId: id,
+            userId: myId
+          }
         }
-    });
+      });
+      if (!existingMember) {
+        await prisma.chatMember.create({
+          data: {
+            chatId: id,
+            userId: myId,
+            lastReadAt: new Date()
+          }
+        });
+        console.log(`✅ Создана запись участника в чате ${id} для пользователя ${myId}`);
+      } else {
+        await prisma.chatMember.update({
+          where: {
+            chatId_userId: {
+              chatId: id,
+              userId: myId
+            }
+          },
+          data: {
+            lastReadAt: new Date()
+          }
+        });
+        console.log(`✅ Отметил прочтение в чате ${id}`);
+      }
+
+      // ✅ НОВОЕ: Помечаем все сообщения в этом чате как прочитанные (кроме своих)
+      await prisma.message.updateMany({
+        where: {
+          chatId: id,
+          senderId: { not: myId },
+          status: 'unread'
+        },
+        data: { status: 'read' }
+      });
+      console.log(`✅ Все сообщения в чате ${id} отмечены как прочитанные`);
+
+      // Отправляем событие остальным участникам
+      io.to(`chat_${id}`).emit('messages_read_update', {
+        activeChatId: `chat_${id}`,
+        readerId: myId
+      });
+
+    } else if (type === 'channel') {
+      // Обновляем lastReadAt для участника канала
+      const member = await prisma.channelMember.findFirst({
+        where: {
+          channelId: id,
+          userId: myId
+        }
+      });
+      if (!member) {
+        await prisma.channelMember.create({
+          data: {
+            channelId: id,
+            userId: myId,
+            role: 'member',
+            lastReadAt: new Date()
+          }
+        });
+        console.log(`✅ Создана запись участника в канале ${id}`);
+      } else {
+        await prisma.channelMember.update({
+          where: { id: member.id },
+          data: { lastReadAt: new Date() }
+        });
+        console.log(`✅ Обновлен lastReadAt для канала ${id}`);
+      }
+
+      // ✅ НОВОЕ: Помечаем все сообщения в канале как прочитанные (кроме своих)
+      await prisma.message.updateMany({
+        where: {
+          channelId: id,
+          senderId: { not: myId },
+          status: 'unread'
+        },
+        data: { status: 'read' }
+      });
+      console.log(`✅ Все сообщения в канале ${id} отмечены как прочитанные`);
+
+      // Отправляем событие остальным участникам
+      io.to(`channel_${id}`).emit('messages_read_update', {
+        activeChatId: `channel_${id}`,
+        readerId: myId
+      });
+
+    } else if (type === 'private') {
+      // Обновляем lastReadAt для приватного чата
+      const privateMember = await prisma.privateChatMember.findUnique({
+        where: {
+          userId_otherUserId: {
+            userId: myId,
+            otherUserId: id
+          }
+        }
+      });
+      if (!privateMember) {
+        await prisma.privateChatMember.create({
+          data: {
+            userId: myId,
+            otherUserId: id,
+            lastReadAt: new Date()
+          }
+        });
+        console.log(`✅ Создана запись приватного чата с ${id}`);
+      } else {
+        await prisma.privateChatMember.update({
+          where: { id: privateMember.id },
+          data: { lastReadAt: new Date() }
+        });
+        console.log(`✅ Обновлен lastReadAt для приватного чата с ${id}`);
+      }
+
+      // Помечаем сообщения как прочитанные
+      await prisma.message.updateMany({
+        where: {
+          senderId: id,
+          receiverId: myId,
+          channelId: null,
+          chatId: null,
+          status: { not: 'read' }
+        },
+        data: { status: 'read' }
+      });
+      console.log(`✅ Все сообщения от ${id} отмечены как прочитанные`);
+
+      // Отправляем событие отправителю (чтобы он увидел галочки)
+      const targetSocketId = onlineUsers.get(id);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit('messages_read_update', {
+          activeChatId: `user_${myId}`,
+          readerId: myId
+        });
+      }
+    }
+
+  } catch (err) {
+    console.error('❌ Ошибка в read_messages:', err);
+  }
+});
+
+
 
     // === СТАТУС ПЕЧАТАНИЯ ===
     socket.on('typing', (data) => {
@@ -1341,6 +1360,11 @@ io.on('connection', (socket) => {
         console.log(`📤 [SERVER] Получен запрос на удаление участника:`, data);
 
         const { chatId, userId, chatType } = data;
+        const chat = await prisma.chat.findUnique({ where: { id: cleanId } });
+if (chat.creatorId !== socket.userId) {
+    // или проверка роли в chatMember, если есть
+    return socket.emit('error', { message: 'Недостаточно прав' });
+}
 
         try {
             let cleanId;
@@ -1483,7 +1507,11 @@ if (removedUserSocketId) {
 
  socket.on('add_member', async(data) => {
     console.log(`📤 [SERVER] Получен запрос на добавление участника:`, data);
-
+const chat = await prisma.chat.findUnique({ where: { id: cleanId } });
+if (chat.creatorId !== socket.userId) {
+    // или проверка роли в chatMember, если есть
+    return socket.emit('error', { message: 'Недостаточно прав' });
+}
     const { chatId, userId, chatType } = data;
 
     try {
@@ -1502,29 +1530,47 @@ if (removedUserSocketId) {
         }
 
         // ✅ ДЛЯ ГРУППОВЫХ ЧАТОВ
-        if (chatType === 'group') {
-            const newMember = await prisma.chatMember.findUnique({
-                where: {
-                    chatId_userId: {
-                        chatId: cleanId,
-                        userId: userId
-                    }
-                },
-                include: {
-                    user: {
-                        select: { id: true, username: true, avatar: true }
-                    }
-                }
-            });
-
-            if (newMember) {
-                console.log(`📤 [SERVER] Отправляю chat_member_added в комнату ${roomName}`);
-                io.to(roomName).emit('chat_member_added', {
-                    chatId: cleanId,
-                    member: newMember
-                });
+if (chatType === 'group') {
+    const newMember = await prisma.chatMember.findUnique({
+        where: {
+            chatId_userId: {
+                chatId: cleanId,
+                userId: userId
+            }
+        },
+        include: {
+            user: {
+                select: { id: true, username: true, avatar: true }
             }
         }
+    });
+
+    if (newMember) {
+        const chat = await prisma.chat.findUnique({
+            where: { id: cleanId },
+            select: { name: true, avatar: true }
+        });
+
+        // Отправляем событие новому участнику напрямую
+        const targetSocketId = onlineUsers.get(userId);
+        if (targetSocketId) {
+            io.to(targetSocketId).emit('chat_member_added', {
+                chatId: cleanId,
+                member: newMember,
+                chatName: chat?.name || 'Групповой чат',
+                chatAvatar: chat?.avatar || '💬'
+            });
+        }
+
+        // Также отправляем всем остальным в комнате
+        io.to(roomName).emit('chat_member_added', {
+            chatId: cleanId,
+            member: newMember,
+            chatName: chat?.name || 'Групповой чат',
+            chatAvatar: chat?.avatar || '💬'
+        });
+    }
+}
 
         // ✅ ДЛЯ КАНАЛОВ (ДОБАВЛЯЕМ!)
         if (chatType === 'channel') {
@@ -3163,12 +3209,16 @@ app.put('/api/chats/:chatId', authenticateToken, upload.single('avatar'), async 
     });
 
     // Отправляем событие всем участникам
-    io.to(`chat_${chatId}`).emit('chat_updated', updatedChat);
+     io.to(`chat_${chatId}`).emit('chat_updated', {
+    ...updatedChat,
+    type: 'group'
+  });
 
     res.json(updatedChat);
   } catch (error) {
     console.error('Ошибка обновления чата:', error);
     res.status(500).json({ error: 'Не удалось обновить чат' });
+    res.json({ ...updatedChannel, type: 'channel' });
   }
 });
 
@@ -3233,13 +3283,18 @@ app.put('/api/channels/:channelId', authenticateToken, upload.single('avatar'), 
     const result = { ...channelData, lastMessage };
 
     // Отправляем событие всем участникам
-    io.to(`channel_${channelId}`).emit('channel_updated', result);
+    io.to(`channel_${channelId}`).emit('channel_updated', {
+    ...updatedChannel,
+    type: 'channel'
+  });
 
     res.json(result);
   } catch (error) {
     console.error('Ошибка обновления канала:', error);
     res.status(500).json({ error: 'Не удалось обновить канал' });
+    res.json({ ...updatedChannel, type: 'channel' });
   }
+  
 });
 
 
