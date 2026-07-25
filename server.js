@@ -1959,6 +1959,23 @@ app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async(
             return res.status(404).json({ error: 'Канал не найден' });
         }
 
+        // Проверяем, что удаляемый участник существует
+        const member = await prisma.channelMember.findUnique({
+            where: {
+                channelId_userId: {
+                    channelId: channelId,
+                    userId: userId
+                }
+            }
+        });
+
+        if (!member) {
+            return res.status(404).json({ error: 'Участник не найден' });
+        }
+
+        // ✅ Разрешаем удаление, если:
+        // - текущий пользователь — админ (может удалить любого)
+        // - или текущий пользователь удаляет самого себя
         const isAdmin = await prisma.channelMember.findFirst({
             where: {
                 channelId: channelId,
@@ -1967,14 +1984,16 @@ app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async(
             }
         });
 
-        if (!isAdmin) {
-            return res.status(403).json({ error: 'Только админ может удалять участников' });
+        if (!isAdmin && userId !== currentUserId) {
+            return res.status(403).json({ error: 'Недостаточно прав для удаления этого участника' });
         }
 
-        if (userId === channel.creatorId) {
+        // Нельзя удалить создателя канала (кроме как если он сам выходит)
+        if (userId === channel.creatorId && userId !== currentUserId) {
             return res.status(400).json({ error: 'Нельзя удалить создателя канала' });
         }
 
+        // Удаляем участника
         await prisma.channelMember.delete({
             where: {
                 channelId_userId: {
@@ -1984,24 +2003,28 @@ app.delete('/api/channels/:channelId/members/:userId', authenticateToken, async(
             }
         });
 
-        // 👇 ПОСЛЕ ЭТОЙ СТРОКИ (await prisma.channelMember.delete) ВСТАВЬ ЭТОТ КОД:
-
-        // Отправляем событие удаленному пользователю
-        const removedUserSocketId = onlineUsers.get(userId);
-        if (removedUserSocketId) {
-            // Отписываем от комнаты, чтобы не получал сообщения
-            const socket = io.sockets.sockets.get(removedUserSocketId);
-            if (socket) {
-                socket.leave(`channel_${channelId}`);
-                console.log(`🚪 Пользователь ${userId} отписан от комнаты channel_${channelId}`);
+        // Если удалили самого себя — отправляем событие ему лично и другим
+        if (userId === currentUserId) {
+            // Отписываем от комнаты через сокет
+            const removedUserSocketId = onlineUsers.get(userId);
+            if (removedUserSocketId) {
+                const socket = io.sockets.sockets.get(removedUserSocketId);
+                if (socket) {
+                    socket.leave(`channel_${channelId}`);
+                }
+                io.to(removedUserSocketId).emit('kicked_from_channel', {
+                    channelId: channelId,
+                    channelName: channel.name
+                });
             }
-            // Отправляем уведомление о кике
-            io.to(removedUserSocketId).emit('kicked_from_channel', {
-                channelId: channelId,
-                channelName: channel.name
-            });
-            console.log(`👢 Пользователь ${userId} удален из канала ${channelId}, отправлено уведомление`);
         }
+
+        // Отправляем событие всем в канале об удалении участника
+        io.to(`channel_${channelId}`).emit('channel_member_removed', {
+            channelId: channelId,
+            userId: userId,
+            channelName: channel.name
+        });
 
         res.json({ success: true, message: 'Участник удален из канала' });
     } catch (error) {
